@@ -5,7 +5,7 @@ from __future__ import print_function
 import click
 import logging
 import os
-import time
+import timeasdf
 
 from ray.tune.error import TuneError
 from ray.tune.experiment import convert_to_experiment_list
