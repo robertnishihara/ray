@@ -1,7 +1,6 @@
 ConfigSpace==0.4.10
 bayesian-optimization
 boto3
-dm_tree
 dragonfly-opt
 gym[atari]
 h5py
