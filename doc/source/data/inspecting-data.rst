@@ -148,7 +148,7 @@ For more on how to read this output, see :ref:`Monitoring Your Workload with the
     :skipif: True
 
     import ray
-    import datasets
+    from huggingface_hub import HfFileSystem
 
     def f(batch):
         return batch
@@ -156,9 +156,11 @@ For more on how to read this output, see :ref:`Monitoring Your Workload with the
     def g(row):
         return True
 
-    hf_ds = datasets.load_dataset("mnist", "mnist")
     ds = (
-        ray.data.from_huggingface(hf_ds["train"])
+        ray.data.read_parquet(
+            "hf://datasets/ylecun/mnist/mnist/train-00000-of-00001.parquet",
+            filesystem=HfFileSystem()
+        )
         .map_batches(f)
         .filter(g)
         .materialize()
