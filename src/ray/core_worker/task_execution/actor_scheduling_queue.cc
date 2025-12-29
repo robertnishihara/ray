@@ -235,8 +235,22 @@ void ActorSchedulingQueue::ScheduleRequests() {
       if (error == boost::asio::error::operation_aborted) {
         return;  // Timer deadline was adjusted.
       }
-      RAY_LOG(ERROR) << "Timed out waiting for task with seq_no=" << next_seq_no_
-                     << ", canceling all queued tasks.";
+      // Extract worker ID from any pending task since they're all from the same client
+      std::string worker_info = "unknown worker";
+      // This should always be true because we only detect this timeout when there are pending tasks
+      if (!pending_actor_tasks_.empty()) {
+        auto worker_id = pending_actor_tasks_.begin()->second.TaskSpec().CallerWorkerId();
+        worker_info = "worker " + worker_id.Hex();
+      }
+      
+      RAY_LOG(ERROR) << "Timed out after " << reorder_wait_seconds_ 
+                     << " seconds waiting for task with seq_no=" << next_seq_no_
+                     << " from " << worker_info << ". "
+                     << "This indicates a critical system failure where the expected task never reached the actor. "
+                     << "Possible causes: gRPC message drop due to network unreliability, resource pressure on "
+                     << "sender (" << worker_info << ") or receiver, or worker crash. "
+                     << "Note: Dropped tasks can go undetected if no subsequent tasks arrive from the same worker. "
+                     << "Canceling all " << pending_actor_tasks_.size() << " queued tasks.";
       while (!pending_actor_tasks_.empty()) {
         auto head = pending_actor_tasks_.begin();
         head->second.Cancel(
