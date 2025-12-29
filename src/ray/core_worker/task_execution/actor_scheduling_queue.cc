@@ -246,9 +246,9 @@ void ActorSchedulingQueue::ScheduleRequests() {
       RAY_LOG(ERROR) << "Timed out after " << reorder_wait_seconds_ 
                      << " seconds waiting for task with seq_no=" << next_seq_no_
                      << " from " << worker_info << ". "
-                     << "This indicates a critical system failure where the expected task never reached the actor. "
+                     << "This indicates an unrecoverable system failure where the expected task never reached the actor. "
                      << "Possible causes: gRPC message drop due to network unreliability, resource pressure on "
-                     << "sender (" << worker_info << ") or receiver, or worker crash. "
+                     << "the sender (" << worker_info << ") or the receiver (this actor), or a worker crash. "
                      << "Note: Dropped tasks can go undetected if no subsequent tasks arrive from the same worker. "
                      << "Canceling all " << pending_actor_tasks_.size() << " queued tasks.";
       while (!pending_actor_tasks_.empty()) {
