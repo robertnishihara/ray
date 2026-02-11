@@ -219,6 +219,9 @@ class LogMonitor:
                             )
                         else:
                             raise e
+                    # Remove from log_filenames so stale entries don't
+                    # accumulate indefinitely.
+                    self.log_filenames.discard(file_info.filename)
 
             if proc_alive:
                 self.closed_file_infos.append(file_info)
@@ -227,6 +230,21 @@ class LogMonitor:
 
     def update_log_filenames(self):
         """Update the list of log files to monitor."""
+        # Clean up stale entries from log_filenames for files that no longer
+        # exist on disk. This prevents unbounded growth of the set when log
+        # files are deleted or rotated.
+        stale_filenames = {
+            f for f in self.log_filenames if not os.path.isfile(f)
+        }
+        if stale_filenames:
+            self.log_filenames -= stale_filenames
+            # Also remove corresponding entries from closed_file_infos.
+            self.closed_file_infos = [
+                info
+                for info in self.closed_file_infos
+                if info.filename not in stale_filenames
+            ]
+
         monitor_log_paths = []
         # output of user code is written here
         monitor_log_paths += glob.glob(
