@@ -1987,11 +1987,17 @@ cdef void execute_task(
 
             if (returns[0].size() > 0
                     and not inspect.isgenerator(outputs)
-                    and not inspect.isasyncgen(outputs)
-                    and len(outputs) != int(returns[0].size())):
-                raise ValueError(
-                    "Task returned {} objects, but num_returns={}.".format(
-                        len(outputs), returns[0].size()))
+                    and not inspect.isasyncgen(outputs)):
+                try:
+                    num_outputs = len(outputs)
+                except TypeError:
+                    raise ValueError(
+                        "Task returned 1 object, but num_returns={}.".format(
+                            returns[0].size()))
+                if num_outputs != int(returns[0].size()):
+                    raise ValueError(
+                        "Task returned {} objects, but num_returns={}.".format(
+                            num_outputs, returns[0].size()))
 
             # Store the outputs in the object store.
             with core_worker.profile_event(b"task:store_outputs"):
@@ -4242,7 +4248,11 @@ cdef class CoreWorker:
             num_returns = returns[0].size()
 
         if num_returns == 0:
-            if outputs is not None and len(outputs) > 0:
+            try:
+                has_outputs = outputs is not None and len(outputs) > 0
+            except TypeError:
+                has_outputs = outputs is not None
+            if has_outputs:
                 # Warn if num_returns=0 but the task returns a non-None value (likely unintended).
                 task_name = self.get_current_task_name()
                 obj_value = repr(outputs)
