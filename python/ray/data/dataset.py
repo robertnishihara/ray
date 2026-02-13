@@ -81,6 +81,11 @@ from ray.data._internal.pandas_block import PandasBlockBuilder, PandasBlockSchem
 from ray.data._internal.plan import ExecutionPlan
 from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 from ray.data._internal.remote_fn import cached_remote_fn
+from ray.data._internal.shuffle_memory_estimate import ShuffleMemoryEstimate
+from ray.data._internal.shuffle_memory_estimator import (
+    estimate_join_memory,
+    estimate_shuffle_memory,
+)
 from ray.data._internal.split import _get_num_rows, _split_at_indices
 from ray.data._internal.stats import DatasetStats, DatasetStatsSummary, _StatsManager
 from ray.data._internal.tensor_extensions.arrow import (
@@ -1663,7 +1668,8 @@ class Dataset:
         shuffle: bool = False,
         keys: Optional[List[str]] = None,
         sort: bool = False,
-    ) -> "Dataset":
+        estimate_only: bool = False,
+    ) -> Union["Dataset", ShuffleMemoryEstimate]:
         """Repartition the :class:`Dataset` into exactly this number of
         :ref:`blocks <dataset_concept>`.
 
@@ -1722,6 +1728,19 @@ class Dataset:
                 is set to True.
             sort: Whether the blocks should be sorted after repartitioning. Note,
                 that by default blocks will be sorted in the ascending order.
+            estimate_only: If True, instead of performing the repartition, return a
+                :class:`~ray.data._internal.shuffle_memory_estimate.ShuffleMemoryEstimate`
+                with detailed memory requirements and partition distribution statistics.
+                This performs a full scan of the data to compute actual partition sizes,
+                enabling accurate skew detection and memory estimates before executing
+                the expensive shuffle operation. Note that this requires ``shuffle=True``
+                and ``keys`` to be specified for hash-based shuffling.
+
+                .. note::
+                    Estimates are based on the current dataset size and do not account
+                    for optimizations like map-side aggregation in groupby operations.
+                    For pipelines with combiners, the actual shuffle may be smaller
+                    than estimated.
 
         Note that you must set either `num_blocks` or `target_num_rows_per_block`
         but not both.
@@ -1729,7 +1748,9 @@ class Dataset:
         when you set shuffle to True.
 
         Returns:
-            The repartitioned :class:`Dataset`.
+            The repartitioned :class:`Dataset`, or a
+            :class:`~ray.data._internal.shuffle_memory_estimate.ShuffleMemoryEstimate`
+            if ``estimate_only=True``.
         """  # noqa: E501
 
         if target_num_rows_per_block is not None:
@@ -1761,6 +1782,38 @@ class Dataset:
             raise ValueError(
                 "`shuffle` must be False when `target_num_rows_per_block` is set."
             )
+
+        # Handle estimate_only mode
+        if estimate_only:
+            if not shuffle:
+                raise ValueError(
+                    "`estimate_only=True` requires `shuffle=True` for hash-based "
+                    "shuffling. Memory estimation is only supported for shuffle "
+                    "operations."
+                )
+            if keys is None:
+                raise ValueError(
+                    "`estimate_only=True` requires `keys` to be specified for "
+                    "hash-based partitioning."
+                )
+            if target_num_rows_per_block is not None:
+                raise ValueError(
+                    "`estimate_only=True` is not supported with "
+                    "`target_num_rows_per_block`."
+                )
+
+            # Materialize the dataset to get the blocks
+            materialized = self.materialize()
+            block_refs = materialized._plan.execute().block_refs
+            blocks = ray.get(block_refs)
+
+            return estimate_shuffle_memory(
+                blocks=blocks,
+                key_columns=keys,
+                num_partitions=num_blocks,
+                data_context=self.context,
+            )
+
         plan = self._plan.copy()
         if target_num_rows_per_block is not None:
             op = StreamingRepartition(
@@ -2786,7 +2839,8 @@ class Dataset:
         partition_size_hint: Optional[int] = None,
         aggregator_ray_remote_args: Optional[Dict[str, Any]] = None,
         validate_schemas: bool = False,
-    ) -> "Dataset":
+        estimate_only: bool = False,
+    ) -> Union["Dataset", ShuffleMemoryEstimate]:
         """Join :class:`Datasets <ray.data.Dataset>` on join keys.
 
         Args:
@@ -2820,10 +2874,24 @@ class Dataset:
             validate_schemas: (Optional) Controls whether validation of provided
                 configuration against input schemas will be performed (defaults to
                 false, since obtaining schemas could be prohibitively expensive).
+            estimate_only: If True, instead of performing the join, return a
+                :class:`~ray.data._internal.shuffle_memory_estimate.ShuffleMemoryEstimate`
+                with detailed memory requirements and partition distribution statistics.
+                This performs a full scan of both datasets to compute actual partition
+                sizes, enabling accurate skew detection and memory estimates before
+                executing the expensive join operation.
+
+                .. note::
+                    Estimates are based on the current dataset sizes and do not account
+                    for optimizations like map-side aggregation. The actual join may
+                    produce different output sizes depending on the join type and key
+                    distribution.
 
         Returns:
             A :class:`Dataset` that holds rows of input left Dataset joined with the
-            right Dataset based on join type and keys.
+            right Dataset based on join type and keys, or a
+            :class:`~ray.data._internal.shuffle_memory_estimate.ShuffleMemoryEstimate`
+            if ``estimate_only=True``.
 
         Examples:
 
@@ -2921,6 +2989,26 @@ class Dataset:
         # NOTE: If no separate keys provided for the right side, assume just the left
         #       side ones
         right_on = right_on or on
+
+        # Handle estimate_only mode
+        if estimate_only:
+            # Materialize both datasets to get the blocks
+            left_materialized = self.materialize()
+            right_materialized = ds.materialize()
+
+            left_block_refs = left_materialized._plan.execute().block_refs
+            right_block_refs = right_materialized._plan.execute().block_refs
+            left_blocks = ray.get(left_block_refs)
+            right_blocks = ray.get(right_block_refs)
+
+            return estimate_join_memory(
+                left_blocks=left_blocks,
+                right_blocks=right_blocks,
+                left_key_columns=list(on),
+                right_key_columns=list(right_on),
+                num_partitions=num_partitions,
+                data_context=self.context,
+            )
 
         # NOTE: By default validating schemas are disabled as it could be arbitrarily
         #       expensive (potentially executing whole pipeline to completion) to fetch
