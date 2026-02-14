@@ -5,6 +5,7 @@ import logging
 import math
 import queue
 import random
+import statistics
 import threading
 import time
 import typing
@@ -55,6 +56,11 @@ from ray.data._internal.execution.interfaces.physical_operator import (
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
+from ray.data._internal.shuffle_memory_estimate import (
+    AggregatorEstimate,
+    PartitionEstimate,
+    ShuffleMemoryEstimate,
+)
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data._internal.table_block import TableBlockAccessor
 from ray.data._internal.util import GiB, MiB
@@ -90,6 +96,60 @@ DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY = env_integer(
 DEFAULT_HASH_SHUFFLE_AGGREGATOR_MEMORY_ALLOCATION = env_integer(
     "RAY_DATA_DEFAULT_HASH_SHUFFLE_AGGREGATOR_MEMORY_ALLOCATION", 1 * GiB
 )
+
+# Default buffer ratio for memory recommendations
+DEFAULT_ESTIMATION_BUFFER_RATIO = 0.15
+
+
+@ray.remote
+def _estimate_partition_sizes(
+    block: Block,
+    key_columns: List[str],
+    num_partitions: int,
+) -> Dict[int, Dict[str, int]]:
+    """Lightweight estimation task - hash and count partition sizes.
+
+    This function hash-partitions the block and counts rows and bytes per
+    partition without actually moving any data.
+
+    Args:
+        block: The input block to analyze.
+        key_columns: Column names to use for hash partitioning.
+        num_partitions: Target number of partitions.
+
+    Returns:
+        Dict mapping partition_id to {"rows": count, "bytes": estimated_bytes}
+    """
+    from ray.data._internal.arrow_ops.transform_pyarrow import _hash_partition
+
+    accessor = BlockAccessor.for_block(block)
+    table = accessor.to_arrow()
+
+    if table.num_rows == 0:
+        return {}
+
+    # Project to key columns for hashing
+    projected_table = table.select(key_columns)
+
+    # Get partition assignments for each row
+    partition_ids = _hash_partition(projected_table, num_partitions)
+
+    # Estimate bytes per row (average across the block)
+    total_bytes = table.nbytes
+    bytes_per_row = total_bytes / table.num_rows if table.num_rows > 0 else 0
+
+    # Count rows and estimate bytes per partition
+    partition_stats: Dict[int, Dict[str, int]] = {}
+    for pid in range(num_partitions):
+        mask = partition_ids == pid
+        count = int(np.sum(mask))
+        if count > 0:
+            partition_stats[pid] = {
+                "rows": count,
+                "bytes": int(count * bytes_per_row),
+            }
+
+    return partition_stats
 
 
 class ShuffleAggregation:
@@ -649,6 +709,16 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         self._reduce_bar = None
         self._reduce_metrics = OpRuntimeMetrics(self)
 
+        # Memory estimation state
+        # Maps input_index -> list of estimation task refs
+        self._estimation_tasks: DefaultDict[int, List[ObjectRef]] = defaultdict(list)
+        # Queued input bundles waiting for estimation to complete
+        self._pending_input_bundles: List[Tuple[RefBundle, int]] = []
+        # Whether estimation phase has completed
+        self._estimation_complete: bool = False
+        # The computed memory estimate (populated after estimation completes)
+        self._memory_estimate: Optional[ShuffleMemoryEstimate] = None
+
     def start(self, options: ExecutionOptions) -> None:
         super().start(options)
 
@@ -666,9 +736,35 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
 
         # TODO move to base class
         self._shuffle_metrics.on_input_received(input_bundle)
-        self._do_add_input_inner(input_bundle, input_index)
 
-    def _do_add_input_inner(self, input_bundle: RefBundle, input_index: int):
+        if self._estimation_complete:
+            # Estimation already done, proceed directly to shuffle
+            self._do_shuffle_input(input_bundle, input_index)
+        else:
+            # Queue bundle and schedule estimation tasks
+            self._pending_input_bundles.append((input_bundle, input_index))
+            self._schedule_estimation_tasks(input_bundle, input_index)
+
+    def _schedule_estimation_tasks(
+        self, input_bundle: RefBundle, input_index: int
+    ) -> None:
+        """Schedule lightweight estimation tasks for each block in the bundle."""
+        input_key_column_names = self._key_column_names[input_index]
+
+        # Skip estimation if no key columns (round-robin case)
+        if not input_key_column_names:
+            return
+
+        for block_ref in input_bundle.block_refs:
+            estimation_ref = _estimate_partition_sizes.remote(
+                block_ref,
+                list(input_key_column_names),
+                self._num_partitions,
+            )
+            self._estimation_tasks[input_index].append(estimation_ref)
+
+    def _do_shuffle_input(self, input_bundle: RefBundle, input_index: int) -> None:
+        """Actually shuffle the input bundle (called after estimation completes)."""
         input_blocks_refs: List[ObjectRef[Block]] = input_bundle.block_refs
         input_blocks_metadata: List[BlockMetadata] = input_bundle.metadata
 
@@ -798,6 +894,235 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                 total_num_tasks=None,
             )
             self._shuffle_bar.update(total=num_rows)
+
+    def all_inputs_done(self) -> None:
+        """Override to complete estimation before marking inputs complete."""
+        # Complete estimation phase first
+        self._complete_estimation()
+
+        # Now process all queued input bundles through actual shuffle
+        for bundle, input_index in self._pending_input_bundles:
+            self._do_shuffle_input(bundle, input_index)
+        self._pending_input_bundles.clear()
+
+        # Call parent to mark inputs complete
+        super().all_inputs_done()
+
+    def _complete_estimation(self) -> None:
+        """Complete the estimation phase and print memory estimate."""
+        if self._estimation_complete:
+            return
+
+        # Gather all estimation results
+        all_estimation_refs = list(
+            itertools.chain.from_iterable(self._estimation_tasks.values())
+        )
+
+        if all_estimation_refs:
+            estimation_results = ray.get(all_estimation_refs)
+
+            # Build the memory estimate
+            estimate = self._build_memory_estimate(estimation_results)
+
+            # Print the estimate summary
+            logger.info(f"\n{estimate.summary()}")
+
+            # Warn if memory looks insufficient
+            if estimate.memory_headroom_ratio < 1.0:
+                logger.warning(
+                    f"Estimated memory requirement "
+                    f"({estimate._format_bytes(estimate.total_required_memory)}) "
+                    f"exceeds available cluster memory "
+                    f"({estimate._format_bytes(estimate.cluster_memory_available)}). "
+                    f"Consider increasing cluster size or reducing num_partitions."
+                )
+
+            self._memory_estimate = estimate
+
+        self._estimation_complete = True
+        self._estimation_tasks.clear()
+
+    def _build_memory_estimate(
+        self, estimation_results: List[Dict[int, Dict[str, int]]]
+    ) -> ShuffleMemoryEstimate:
+        """Build a ShuffleMemoryEstimate from estimation task results."""
+        # Aggregate partition stats across all blocks
+        partition_totals: Dict[int, Dict[str, int]] = defaultdict(
+            lambda: {"rows": 0, "bytes": 0}
+        )
+
+        for partition_stats in estimation_results:
+            for pid, stats in partition_stats.items():
+                partition_totals[pid]["rows"] += stats["rows"]
+                partition_totals[pid]["bytes"] += stats["bytes"]
+
+        # Build partition estimates list
+        partition_estimates = []
+        for pid in range(self._num_partitions):
+            stats = partition_totals.get(pid, {"rows": 0, "bytes": 0})
+            partition_estimates.append(
+                PartitionEstimate(
+                    partition_id=pid,
+                    num_rows=stats["rows"],
+                    size_bytes=stats["bytes"],
+                )
+            )
+
+        # Compute total input stats
+        total_rows = sum(p.num_rows for p in partition_estimates)
+        total_bytes = sum(p.size_bytes for p in partition_estimates)
+
+        # Compute partition size distribution metrics
+        sizes = [p.size_bytes for p in partition_estimates]
+
+        if sizes:
+            partition_size_min = min(sizes)
+            partition_size_max = max(sizes)
+            partition_size_mean = statistics.mean(sizes) if sizes else 0.0
+            partition_size_std = statistics.stdev(sizes) if len(sizes) > 1 else 0.0
+            partition_size_percentiles = {
+                50: int(np.percentile(sizes, 50)),
+                90: int(np.percentile(sizes, 90)),
+                95: int(np.percentile(sizes, 95)),
+                99: int(np.percentile(sizes, 99)),
+            }
+        else:
+            partition_size_min = 0
+            partition_size_max = 0
+            partition_size_mean = 0.0
+            partition_size_std = 0.0
+            partition_size_percentiles = {50: 0, 90: 0, 95: 0, 99: 0}
+
+        # Count empty partitions
+        empty_partition_count = sum(1 for s in sizes if s == 0)
+
+        # Identify hot partitions (top 10 by size)
+        hot_partitions = sorted(
+            partition_estimates, key=lambda p: p.size_bytes, reverse=True
+        )[:10]
+
+        # Compute skew metrics
+        skew_factor = (
+            partition_size_max / partition_size_mean if partition_size_mean > 0 else 0.0
+        )
+
+        # Generate skew warnings (partitions > 2x mean)
+        skew_warnings = []
+        if partition_size_mean > 0:
+            for p in partition_estimates:
+                ratio = p.size_bytes / partition_size_mean
+                if ratio > 2.0:
+                    skew_warnings.append(
+                        f"Partition {p.partition_id}: {ratio:.1f}x mean "
+                        f"({p.size_bytes / MiB:.1f} MiB)"
+                    )
+
+        # Compute per-aggregator breakdown
+        num_aggregators = self._aggregator_pool.num_aggregators
+        aggregator_estimates = []
+        for agg_id in range(num_aggregators):
+            assigned_partitions = [
+                p
+                for p in partition_estimates
+                if p.partition_id % num_aggregators == agg_id
+            ]
+            partition_ids = [p.partition_id for p in assigned_partitions]
+            agg_total_bytes = sum(p.size_bytes for p in assigned_partitions)
+            agg_total_rows = sum(p.num_rows for p in assigned_partitions)
+            largest_partition_bytes = (
+                max(p.size_bytes for p in assigned_partitions)
+                if assigned_partitions
+                else 0
+            )
+
+            aggregator_estimates.append(
+                AggregatorEstimate(
+                    aggregator_id=agg_id,
+                    partition_ids=partition_ids,
+                    total_bytes=agg_total_bytes,
+                    total_rows=agg_total_rows,
+                    largest_partition_bytes=largest_partition_bytes,
+                )
+            )
+
+        # Find worst-case aggregator
+        worst_case_aggregator = max(aggregator_estimates, key=lambda a: a.total_bytes)
+
+        # Calculate memory requirements
+        aggregator_input_object_store_bytes = worst_case_aggregator.total_bytes
+        aggregator_output_object_store_bytes = worst_case_aggregator.total_bytes
+        aggregator_heap_memory_bytes = 0  # No heap memory for simple shuffle
+
+        required_memory_per_aggregator = (
+            aggregator_input_object_store_bytes + aggregator_output_object_store_bytes
+        )
+        buffer_memory_bytes = int(
+            required_memory_per_aggregator * DEFAULT_ESTIMATION_BUFFER_RATIO
+        )
+        recommended_memory_per_aggregator = (
+            required_memory_per_aggregator + buffer_memory_bytes
+        )
+
+        # Get cluster resources
+        try:
+            cluster_resources = ray.cluster_resources()
+            cluster_memory_available = int(cluster_resources.get("memory", 0))
+        except Exception:
+            cluster_memory_available = 0
+
+        total_required_memory = required_memory_per_aggregator * num_aggregators
+        memory_headroom_ratio = (
+            cluster_memory_available / total_required_memory
+            if total_required_memory > 0
+            else float("inf")
+        )
+
+        # Get key columns for display
+        key_columns = list(self._key_column_names[0]) if self._key_column_names else []
+
+        return ShuffleMemoryEstimate(
+            # Input statistics
+            total_rows=total_rows,
+            total_bytes=total_bytes,
+            num_partitions=self._num_partitions,
+            num_aggregators=num_aggregators,
+            key_columns=key_columns,
+            # Partition distribution
+            partition_estimates=partition_estimates,
+            partition_size_percentiles=partition_size_percentiles,
+            empty_partition_count=empty_partition_count,
+            key_cardinality=0,  # Not computed in streaming mode
+            hot_partitions=hot_partitions,
+            # Skew metrics
+            partition_size_min_bytes=partition_size_min,
+            partition_size_max_bytes=partition_size_max,
+            partition_size_mean_bytes=partition_size_mean,
+            partition_size_std_bytes=partition_size_std,
+            skew_factor=skew_factor,
+            skew_warnings=skew_warnings,
+            # Per-aggregator breakdown
+            aggregator_estimates=aggregator_estimates,
+            worst_case_aggregator=worst_case_aggregator,
+            # Memory requirements
+            aggregator_heap_memory_bytes=aggregator_heap_memory_bytes,
+            aggregator_input_object_store_bytes=aggregator_input_object_store_bytes,
+            aggregator_output_object_store_bytes=aggregator_output_object_store_bytes,
+            required_memory_per_aggregator=required_memory_per_aggregator,
+            buffer_memory_bytes=buffer_memory_bytes,
+            recommended_memory_per_aggregator=recommended_memory_per_aggregator,
+            # Cluster comparison
+            cluster_memory_available=cluster_memory_available,
+            total_required_memory=total_required_memory,
+            memory_headroom_ratio=memory_headroom_ratio,
+            # Configuration
+            recommended_ray_remote_args={"memory": recommended_memory_per_aggregator},
+            # Join-specific (not applicable for shuffle)
+            left_bytes_per_partition=None,
+            right_bytes_per_partition=None,
+            estimated_output_size_bytes=None,
+            is_join=False,
+            _buffer_ratio=DEFAULT_ESTIMATION_BUFFER_RATIO,
+        )
 
     def has_next(self) -> bool:
         self._try_finalize()
@@ -1054,10 +1379,57 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
 
     def has_completed(self) -> bool:
         # TODO separate marking as completed from the check
-        return self._is_finalized() and super().has_completed()
+        completed = self._is_finalized() and super().has_completed()
+
+        # Run validation when we first detect completion
+        if completed and self._memory_estimate is not None:
+            self._validate_estimates()
+            # Clear estimate to avoid running validation again
+            self._memory_estimate = None
+
+        return completed
 
     def _is_finalized(self):
         return len(self._pending_finalization_partition_ids) == 0
+
+    def _validate_estimates(self) -> None:
+        """Compare estimated vs actual partition sizes after shuffle completes."""
+        if self._memory_estimate is None:
+            return
+
+        # Build actual sizes from self._partitions_stats
+        actual_sizes: Dict[int, int] = defaultdict(int)
+        for seq_stats in self._partitions_stats.values():
+            for pid, stats in seq_stats.items():
+                actual_sizes[pid] += stats.byte_size
+
+        # Compare with estimates
+        estimated_sizes = {
+            p.partition_id: p.size_bytes
+            for p in self._memory_estimate.partition_estimates
+        }
+
+        errors = []
+        for pid in range(self._num_partitions):
+            est = estimated_sizes.get(pid, 0)
+            act = actual_sizes.get(pid, 0)
+            if est > 0:
+                error = abs(act - est) / est
+                errors.append(error)
+
+        if errors:
+            max_error = max(errors)
+            avg_error = sum(errors) / len(errors)
+            if max_error > 0.1:  # >10% error
+                logger.warning(
+                    f"Shuffle estimation validation: max partition size error "
+                    f"was {max_error:.1%}, avg error was {avg_error:.1%}"
+                )
+            else:
+                logger.info(
+                    f"Shuffle estimation validated: max partition size error "
+                    f"was {max_error:.1%}, avg error was {avg_error:.1%}"
+                )
 
     def _handle_shuffled_block_metadata(
         self,
