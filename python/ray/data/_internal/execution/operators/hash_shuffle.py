@@ -121,6 +121,7 @@ def _estimate_partition_sizes(
         Dict mapping partition_id to {"rows": count, "bytes": estimated_bytes}
     """
     from ray.data._internal.arrow_ops.transform_pyarrow import _hash_partition
+    from ray.data.block import BlockAccessor
 
     accessor = BlockAccessor.for_block(block)
     table = accessor.to_arrow()
