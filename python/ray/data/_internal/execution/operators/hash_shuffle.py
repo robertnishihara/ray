@@ -101,16 +101,38 @@ DEFAULT_HASH_SHUFFLE_AGGREGATOR_MEMORY_ALLOCATION = env_integer(
 DEFAULT_ESTIMATION_BUFFER_RATIO = 0.15
 
 
+def _hash_key_tuple(key_tuple: tuple) -> int:
+    """Hash a key tuple to a 64-bit integer for memory-efficient key tracking.
+
+    This allows us to track distinct keys without storing potentially large
+    key values. Hash collisions cause undercounting, but:
+    - For low cardinality (where we care most), collision probability is negligible
+    - For high cardinality (1000+), we don't care about exact counts anyway
+    """
+    import hashlib
+
+    # Use MD5 for speed, take first 8 bytes as int64
+    # (We don't need cryptographic security, just good distribution)
+    h = hashlib.md5(str(key_tuple).encode()).digest()[:8]
+    return int.from_bytes(h, byteorder="little")
+
+
 @ray.remote
 def _estimate_partition_sizes(
     block: Block,
     key_columns: List[str],
     num_partitions: int,
 ) -> Dict[int, Dict[str, Any]]:
-    """Estimate partition sizes with exact bytes and distinct key tracking.
+    """Estimate partition sizes with exact bytes and distinct key counts.
 
     This function hash-partitions the block and computes exact bytes and
-    distinct keys per partition without actually moving any data.
+    tracks distinct keys per partition using hashed key fingerprints.
+
+    Key hashing approach:
+    - Each key tuple is hashed to 8 bytes (int64)
+    - Hashed keys are stored in sets and unioned across blocks
+    - Exact for low cardinality (no collisions), approximate for high cardinality
+    - Memory: O(distinct_keys × 8 bytes) regardless of actual key size
 
     Args:
         block: The input block to analyze.
@@ -121,7 +143,7 @@ def _estimate_partition_sizes(
         Dict mapping partition_id to {
             "rows": row count,
             "bytes": exact byte size,
-            "keys": set of distinct key tuples in this partition
+            "key_hashes": set of hashed key fingerprints (int64)
         }
     """
     import pyarrow as pa
@@ -141,25 +163,46 @@ def _estimate_partition_sizes(
     # Get partition assignments for each row
     partition_ids = _hash_partition(key_table, num_partitions)
 
+    # Pre-compute key hashes for all rows (vectorized where possible)
+    # Convert key columns to list of tuples for hashing
+    key_arrays = [col.to_pylist() for col in key_table.columns]
+    num_rows = table.num_rows
+    key_hashes = [
+        _hash_key_tuple(tuple(key_arrays[c][r] for c in range(len(key_columns))))
+        for r in range(num_rows)
+    ]
+
     # Compute exact stats per partition
     partition_stats: Dict[int, Dict[str, Any]] = {}
     for pid in range(num_partitions):
         mask = partition_ids == pid
         count = int(np.sum(mask))
         if count > 0:
-            # Filter to get exact bytes (Arrow filter is zero-copy)
-            partition_table = table.filter(pa.array(mask, type=pa.bool_()))
-            partition_keys = key_table.filter(pa.array(mask, type=pa.bool_()))
+            # Filter to get partition's data
+            bool_mask = pa.array(mask, type=pa.bool_())
+            partition_table = table.filter(bool_mask)
 
-            # Extract distinct keys as a set of tuples
-            # Convert to pandas for easy row iteration
-            keys_df = partition_keys.to_pandas()
-            distinct_keys = set(map(tuple, keys_df.values))
+            # Compute exact byte size (consistent with validation which uses table.nbytes)
+            exact_bytes = partition_table.nbytes
+
+            # Collect hashed keys for this partition
+            # If > 1000 keys, just send count (we don't care about exact high counts)
+            partition_key_hashes = {key_hashes[r] for r in range(num_rows) if mask[r]}
+
+            # Cap at 1000 - if more, send count instead of set
+            KEY_HASH_THRESHOLD = 1000
+            if len(partition_key_hashes) > KEY_HASH_THRESHOLD:
+                key_info = {
+                    "high_cardinality": True,
+                    "count": len(partition_key_hashes),
+                }
+            else:
+                key_info = {"high_cardinality": False, "hashes": partition_key_hashes}
 
             partition_stats[pid] = {
                 "rows": count,
-                "bytes": partition_table.nbytes,  # Exact bytes
-                "keys": distinct_keys,  # Distinct keys for this partition
+                "bytes": exact_bytes,
+                "key_info": key_info,
             }
 
     return partition_stats
@@ -1014,23 +1057,44 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         """Build a ShuffleMemoryEstimate from estimation task results."""
         # Aggregate partition stats across all blocks
         # For rows/bytes: sum them
-        # For keys: union the sets
+        # For keys: union hashes if all blocks have low cardinality, else use counts
         partition_totals: Dict[int, Dict[str, Any]] = defaultdict(
-            lambda: {"rows": 0, "bytes": 0, "keys": set()}
+            lambda: {
+                "rows": 0,
+                "bytes": 0,
+                "key_hashes": set(),
+                "high_cardinality": False,
+            }
         )
 
         for partition_stats in estimation_results:
             for pid, stats in partition_stats.items():
                 partition_totals[pid]["rows"] += stats["rows"]
                 partition_totals[pid]["bytes"] += stats["bytes"]
-                partition_totals[pid]["keys"].update(stats.get("keys", set()))
+
+                key_info = stats.get("key_info", {})
+                if key_info.get("high_cardinality", False):
+                    # Once any block reports high cardinality, mark it
+                    partition_totals[pid]["high_cardinality"] = True
+                elif not partition_totals[pid]["high_cardinality"]:
+                    # Only union hashes if we haven't seen high cardinality
+                    partition_totals[pid]["key_hashes"].update(
+                        key_info.get("hashes", set())
+                    )
 
         # Build partition estimates list
         partition_estimates = []
         total_distinct_keys = 0
         for pid in range(self._num_partitions):
-            stats = partition_totals.get(pid, {"rows": 0, "bytes": 0, "keys": set()})
-            distinct_keys = len(stats["keys"])
+            stats = partition_totals.get(
+                pid,
+                {"rows": 0, "bytes": 0, "key_hashes": set(), "high_cardinality": False},
+            )
+            if stats["high_cardinality"]:
+                # High cardinality - we know it's > 1000, report as such
+                distinct_keys = max(1000, len(stats["key_hashes"]))
+            else:
+                distinct_keys = len(stats["key_hashes"])
             total_distinct_keys += distinct_keys
             partition_estimates.append(
                 PartitionEstimate(
