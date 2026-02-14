@@ -710,15 +710,23 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         self._reduce_bar = None
         self._reduce_metrics = OpRuntimeMetrics(self)
 
-        # Memory estimation state
-        # Maps input_index -> list of estimation task refs
-        self._estimation_tasks: DefaultDict[int, List[ObjectRef]] = defaultdict(list)
+        # Memory estimation state (callback-based, non-blocking)
         # Queued input bundles waiting for estimation to complete
         self._pending_input_bundles: List[Tuple[RefBundle, int]] = []
         # Whether estimation phase has completed
         self._estimation_complete: bool = False
         # The computed memory estimate (populated after estimation completes)
         self._memory_estimate: Optional[ShuffleMemoryEstimate] = None
+        # Track estimation tasks: task_id -> MetadataOpTask
+        self._estimation_task_map: Dict[int, MetadataOpTask] = {}
+        # Next task ID for estimation tasks
+        self._next_estimation_task_id: int = 0
+        # Accumulated estimation results (populated incrementally via callbacks)
+        self._estimation_results: List[Dict[int, Dict[str, int]]] = []
+        # Total number of estimation tasks submitted
+        self._total_estimation_tasks: int = 0
+        # Whether all inputs have been received
+        self._all_inputs_received: bool = False
 
     def start(self, options: ExecutionOptions) -> None:
         super().start(options)
@@ -749,7 +757,10 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
     def _schedule_estimation_tasks(
         self, input_bundle: RefBundle, input_index: int
     ) -> None:
-        """Schedule lightweight estimation tasks for each block in the bundle."""
+        """Schedule lightweight estimation tasks for each block in the bundle.
+
+        Uses callback-based tracking to avoid blocking the executor thread.
+        """
         input_key_column_names = self._key_column_names[input_index]
 
         # Skip estimation if no key columns (round-robin case)
@@ -762,7 +773,31 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                 list(input_key_column_names),
                 self._num_partitions,
             )
-            self._estimation_tasks[input_index].append(estimation_ref)
+
+            # Create callback for when this estimation task completes
+            task_id = self._next_estimation_task_id
+            self._next_estimation_task_id += 1
+            self._total_estimation_tasks += 1
+
+            def make_callback(tid: int):
+                def _on_estimation_done():
+                    task = self._estimation_task_map.pop(tid, None)
+                    if task is not None:
+                        # Get the result (task is already complete, so instant)
+                        result = ray.get(task.get_waitable())
+                        self._estimation_results.append(result)
+                        # Check if all estimation is done
+                        self._try_complete_estimation()
+
+                return _on_estimation_done
+
+            # Track as MetadataOpTask for integration with scheduler
+            task = MetadataOpTask(
+                task_index=task_id,
+                object_ref=estimation_ref,
+                task_done_callback=make_callback(task_id),
+            )
+            self._estimation_task_map[task_id] = task
 
     def _do_shuffle_input(self, input_bundle: RefBundle, input_index: int) -> None:
         """Actually shuffle the input bundle (called after estimation completes)."""
@@ -897,33 +932,43 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             self._shuffle_bar.update(total=num_rows)
 
     def all_inputs_done(self) -> None:
-        """Override to complete estimation before marking inputs complete."""
-        # Complete estimation phase first
-        self._complete_estimation()
+        """Override to mark inputs received and try to complete estimation.
 
-        # Now process all queued input bundles through actual shuffle
-        for bundle, input_index in self._pending_input_bundles:
-            self._do_shuffle_input(bundle, input_index)
-        self._pending_input_bundles.clear()
+        This method is non-blocking. If estimation tasks are still pending,
+        they will complete via callbacks and trigger _try_complete_estimation().
+        """
+        self._all_inputs_received = True
+        # Try to complete - will succeed if all estimation tasks are done
+        self._try_complete_estimation()
+        # Note: super().all_inputs_done() is called from _try_complete_estimation()
+        # after estimation completes and queued bundles are processed
 
-        # Call parent to mark inputs complete
-        super().all_inputs_done()
+    def _try_complete_estimation(self) -> None:
+        """Try to complete estimation phase (non-blocking).
 
-    def _complete_estimation(self) -> None:
-        """Complete the estimation phase and print memory estimate."""
+        Called when:
+        1. An estimation task completes (via callback)
+        2. all_inputs_done() is called
+
+        Will only complete if both conditions are met:
+        - All inputs have been received
+        - All estimation tasks have completed
+        """
         if self._estimation_complete:
             return
 
-        # Gather all estimation results
-        all_estimation_refs = list(
-            itertools.chain.from_iterable(self._estimation_tasks.values())
+        # Check if all estimation tasks have completed
+        all_estimation_done = (
+            len(self._estimation_results) >= self._total_estimation_tasks
         )
 
-        if all_estimation_refs:
-            estimation_results = ray.get(all_estimation_refs)
+        # Can only complete if all inputs received AND all estimation done
+        if not (self._all_inputs_received and all_estimation_done):
+            return
 
-            # Build the memory estimate
-            estimate = self._build_memory_estimate(estimation_results)
+        # All estimation tasks are done - build and print the estimate
+        if self._estimation_results:
+            estimate = self._build_memory_estimate(self._estimation_results)
 
             # Print the estimate summary
             logger.info(f"\n{estimate.summary()}")
@@ -941,7 +986,15 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             self._memory_estimate = estimate
 
         self._estimation_complete = True
-        self._estimation_tasks.clear()
+        self._estimation_results.clear()
+
+        # Now process all queued input bundles through actual shuffle
+        for bundle, input_index in self._pending_input_bundles:
+            self._do_shuffle_input(bundle, input_index)
+        self._pending_input_bundles.clear()
+
+        # Call parent to mark inputs complete
+        super().all_inputs_done()
 
     def _build_memory_estimate(
         self, estimation_results: List[Dict[int, Dict[str, int]]]
@@ -1141,13 +1194,18 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         return bundle
 
     def get_active_tasks(self) -> List[OpTask]:
+        # Collect estimation tasks (if estimation phase is still running)
+        estimation_tasks: List[MetadataOpTask] = list(
+            self._estimation_task_map.values()
+        )
+
         # Collect shuffling tasks for every input sequence
         shuffling_tasks = self._get_active_shuffling_tasks()
 
         # Collect aggregating tasks for every input sequence
         finalizing_tasks: List[DataOpTask] = list(self._finalizing_tasks.values())
 
-        return shuffling_tasks + finalizing_tasks
+        return estimation_tasks + shuffling_tasks + finalizing_tasks
 
     def _get_active_shuffling_tasks(self) -> List[MetadataOpTask]:
         return list(
