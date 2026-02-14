@@ -106,11 +106,11 @@ def _estimate_partition_sizes(
     block: Block,
     key_columns: List[str],
     num_partitions: int,
-) -> Dict[int, Dict[str, int]]:
-    """Lightweight estimation task - hash and count partition sizes.
+) -> Dict[int, Dict[str, Any]]:
+    """Estimate partition sizes with exact bytes and distinct key tracking.
 
-    This function hash-partitions the block and counts rows and bytes per
-    partition without actually moving any data.
+    This function hash-partitions the block and computes exact bytes and
+    distinct keys per partition without actually moving any data.
 
     Args:
         block: The input block to analyze.
@@ -118,8 +118,14 @@ def _estimate_partition_sizes(
         num_partitions: Target number of partitions.
 
     Returns:
-        Dict mapping partition_id to {"rows": count, "bytes": estimated_bytes}
+        Dict mapping partition_id to {
+            "rows": row count,
+            "bytes": exact byte size,
+            "keys": set of distinct key tuples in this partition
+        }
     """
+    import pyarrow as pa
+
     from ray.data._internal.arrow_ops.transform_pyarrow import _hash_partition
     from ray.data.block import BlockAccessor
 
@@ -130,24 +136,30 @@ def _estimate_partition_sizes(
         return {}
 
     # Project to key columns for hashing
-    projected_table = table.select(key_columns)
+    key_table = table.select(key_columns)
 
     # Get partition assignments for each row
-    partition_ids = _hash_partition(projected_table, num_partitions)
+    partition_ids = _hash_partition(key_table, num_partitions)
 
-    # Estimate bytes per row (average across the block)
-    total_bytes = table.nbytes
-    bytes_per_row = total_bytes / table.num_rows if table.num_rows > 0 else 0
-
-    # Count rows and estimate bytes per partition
-    partition_stats: Dict[int, Dict[str, int]] = {}
+    # Compute exact stats per partition
+    partition_stats: Dict[int, Dict[str, Any]] = {}
     for pid in range(num_partitions):
         mask = partition_ids == pid
         count = int(np.sum(mask))
         if count > 0:
+            # Filter to get exact bytes (Arrow filter is zero-copy)
+            partition_table = table.filter(pa.array(mask, type=pa.bool_()))
+            partition_keys = key_table.filter(pa.array(mask, type=pa.bool_()))
+
+            # Extract distinct keys as a set of tuples
+            # Convert to pandas for easy row iteration
+            keys_df = partition_keys.to_pandas()
+            distinct_keys = set(map(tuple, keys_df.values))
+
             partition_stats[pid] = {
                 "rows": count,
-                "bytes": int(count * bytes_per_row),
+                "bytes": partition_table.nbytes,  # Exact bytes
+                "keys": distinct_keys,  # Distinct keys for this partition
             }
 
     return partition_stats
@@ -997,28 +1009,35 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         super().all_inputs_done()
 
     def _build_memory_estimate(
-        self, estimation_results: List[Dict[int, Dict[str, int]]]
+        self, estimation_results: List[Dict[int, Dict[str, Any]]]
     ) -> ShuffleMemoryEstimate:
         """Build a ShuffleMemoryEstimate from estimation task results."""
         # Aggregate partition stats across all blocks
-        partition_totals: Dict[int, Dict[str, int]] = defaultdict(
-            lambda: {"rows": 0, "bytes": 0}
+        # For rows/bytes: sum them
+        # For keys: union the sets
+        partition_totals: Dict[int, Dict[str, Any]] = defaultdict(
+            lambda: {"rows": 0, "bytes": 0, "keys": set()}
         )
 
         for partition_stats in estimation_results:
             for pid, stats in partition_stats.items():
                 partition_totals[pid]["rows"] += stats["rows"]
                 partition_totals[pid]["bytes"] += stats["bytes"]
+                partition_totals[pid]["keys"].update(stats.get("keys", set()))
 
         # Build partition estimates list
         partition_estimates = []
+        total_distinct_keys = 0
         for pid in range(self._num_partitions):
-            stats = partition_totals.get(pid, {"rows": 0, "bytes": 0})
+            stats = partition_totals.get(pid, {"rows": 0, "bytes": 0, "keys": set()})
+            distinct_keys = len(stats["keys"])
+            total_distinct_keys += distinct_keys
             partition_estimates.append(
                 PartitionEstimate(
                     partition_id=pid,
                     num_rows=stats["rows"],
                     size_bytes=stats["bytes"],
+                    distinct_keys=distinct_keys,
                 )
             )
 
@@ -1145,7 +1164,7 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             partition_estimates=partition_estimates,
             partition_size_percentiles=partition_size_percentiles,
             empty_partition_count=empty_partition_count,
-            key_cardinality=0,  # Not computed in streaming mode
+            key_cardinality=total_distinct_keys,  # Sum of distinct keys per partition
             hot_partitions=hot_partitions,
             # Skew metrics
             partition_size_min_bytes=partition_size_min,

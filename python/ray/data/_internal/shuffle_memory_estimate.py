@@ -19,12 +19,14 @@ class PartitionEstimate:
     Attributes:
         partition_id: The partition index (0 to num_partitions-1).
         num_rows: Number of rows in this partition.
-        size_bytes: Estimated size in bytes of this partition.
+        size_bytes: Exact size in bytes of this partition.
+        distinct_keys: Number of distinct key values in this partition.
     """
 
     partition_id: int
     num_rows: int
     size_bytes: int
+    distinct_keys: int = 0
 
 
 @dataclass
@@ -230,9 +232,10 @@ class ShuffleMemoryEstimate:
                     if self.partition_size_mean_bytes > 0
                     else 0
                 )
+                keys_info = f", {p.distinct_keys:,} keys" if p.distinct_keys > 0 else ""
                 lines.append(
                     f"  Partition {p.partition_id}: "
-                    f"{self._format_bytes(p.size_bytes)} ({ratio:.2f}x mean)"
+                    f"{self._format_bytes(p.size_bytes)} ({ratio:.2f}x mean{keys_info})"
                 )
             lines.append("")
 
