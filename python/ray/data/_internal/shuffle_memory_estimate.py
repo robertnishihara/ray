@@ -5,7 +5,6 @@ repartition() and join() operations, enabling users to understand memory
 requirements before executing expensive shuffle operations.
 """
 
-import statistics
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -194,214 +193,76 @@ class ShuffleMemoryEstimate:
         """
         lines = []
         operation = "Join" if self.is_join else "Shuffle"
-        lines.append(f"{operation} Memory Estimation Summary")
-        lines.append("=" * (len(lines[0])))
+        lines.append(f"{operation} Memory Estimation")
+        lines.append("=" * len(lines[0]))
+
+        # Basic info
         lines.append(
             f"Input: {self.total_rows:,} rows, {self._format_bytes(self.total_bytes)}"
         )
         lines.append(
-            f"Partitions: {self.num_partitions}, Aggregators: {self.num_aggregators}"
+            f"Output: {self.num_partitions} partitions across {self.num_aggregators} workers"
         )
-        lines.append(f"Key Columns: {', '.join(self.key_columns)}")
-        lines.append(f"Key Cardinality: {self.key_cardinality:,} distinct values")
         lines.append("")
 
-        # Partition size distribution
-        lines.append("Partition Size Distribution:")
-        p50 = self.partition_size_percentiles.get(50, 0)
-        p90 = self.partition_size_percentiles.get(90, 0)
-        p99 = self.partition_size_percentiles.get(99, 0)
-        lines.append(
-            f"  Min: {self._format_bytes(self.partition_size_min_bytes):>12}    "
-            f"p50: {self._format_bytes(p50)}"
-        )
-        lines.append(
-            f"  Max: {self._format_bytes(self.partition_size_max_bytes):>12}    "
-            f"p90: {self._format_bytes(p90)}"
-        )
-        lines.append(
-            f"  Mean: {self._format_bytes(int(self.partition_size_mean_bytes)):>11}   "
-            f"p99: {self._format_bytes(p99)}"
-        )
-        lines.append(
-            f"  Std: {self._format_bytes(int(self.partition_size_std_bytes)):>12}"
-        )
-        lines.append(f"  Empty Partitions: {self.empty_partition_count}")
-        lines.append(f"  Skew Factor: {self.skew_factor:.2f}x")
-        lines.append("")
-
-        # Hot partitions
-        if self.hot_partitions:
-            lines.append("Hot Partitions (top 5):")
-            for p in self.hot_partitions[:5]:
-                ratio = (
-                    p.size_bytes / self.partition_size_mean_bytes
-                    if self.partition_size_mean_bytes > 0
-                    else 0
-                )
-                keys_info = f", {p.distinct_keys:,} keys" if p.distinct_keys > 0 else ""
+        # Data distribution - only show if there's skew
+        if self.skew_factor > 1.5 or self.empty_partition_count > 0:
+            lines.append("Data Distribution:")
+            if self.skew_factor > 1.5:
                 lines.append(
-                    f"  Partition {p.partition_id}: "
-                    f"{self._format_bytes(p.size_bytes)} ({ratio:.2f}x mean{keys_info})"
+                    f"  Skew detected: largest partition is {self.skew_factor:.1f}x the average"
+                )
+            if self.empty_partition_count > 0:
+                lines.append(
+                    f"  Empty partitions: {self.empty_partition_count} of {self.num_partitions}"
                 )
             lines.append("")
 
-        # Per-aggregator breakdown
-        lines.append("Per-Aggregator Breakdown:")
-        partitions_per_agg = self.num_partitions // self.num_aggregators
-        lines.append(
-            f"  Aggregators handle ~{partitions_per_agg} partitions each "
-            f"({self.num_partitions} / {self.num_aggregators})"
-        )
-        lines.append(
-            f"  Worst-case aggregator #{self.worst_case_aggregator.aggregator_id}: "
-            f"{self._format_bytes(self.worst_case_aggregator.total_bytes)} "
-            f"(partitions {self.worst_case_aggregator.partition_ids[:5]}"
-            f"{'...' if len(self.worst_case_aggregator.partition_ids) > 5 else ''})"
-        )
-        # Find best-case aggregator
-        best_agg = min(self.aggregator_estimates, key=lambda a: a.total_bytes)
-        lines.append(
-            f"  Best-case aggregator #{best_agg.aggregator_id}: "
-            f"{self._format_bytes(best_agg.total_bytes)}"
-        )
-        lines.append("")
-
-        # Memory requirements
-        lines.append("Memory Requirements (per aggregator, worst-case):")
-        lines.append(
-            f"  Object Store (input):  {self._format_bytes(self.aggregator_input_object_store_bytes)}"
-        )
-        lines.append(
-            f"  Object Store (output): {self._format_bytes(self.aggregator_output_object_store_bytes)}"
-        )
-        lines.append(
-            f"  Heap Memory: {self._format_bytes(self.aggregator_heap_memory_bytes)}"
-        )
-        lines.append("  " + "-" * 35)
-        lines.append(
-            f"  Required:     {self._format_bytes(self.required_memory_per_aggregator)}  "
-            f"(minimum based on actual partition sizes)"
-        )
-        buffer_pct = int(self._buffer_ratio * 100)
-        lines.append(
-            f"  Buffer ({buffer_pct}%):  {self._format_bytes(self.buffer_memory_bytes)}  "
-            f"(for fragmentation/temp allocations)"
-        )
-        lines.append(
-            f"  Recommended:  {self._format_bytes(self.recommended_memory_per_aggregator)}"
-        )
-        lines.append("")
-
-        # Cluster resources
-        lines.append("Cluster Resources:")
-        lines.append(
-            f"  Available memory: {self._format_bytes(self.cluster_memory_available)}"
-        )
-        lines.append(
-            f"  Required (all aggregators): {self._format_bytes(self.total_required_memory)}"
-        )
-        status = "\u2713" if self.memory_headroom_ratio >= 1.0 else "\u2717"
-        lines.append(f"  Headroom: {self.memory_headroom_ratio:.1f}x {status}")
-        lines.append("")
-
-        # Join-specific stats
-        if self.is_join and self.left_bytes_per_partition is not None:
-            lines.append("Join-Specific Stats:")
-            left_sizes = self.left_bytes_per_partition
-            right_sizes = self.right_bytes_per_partition or []
-            if left_sizes:
-                left_avg = statistics.mean(left_sizes) if left_sizes else 0
-                left_max = max(left_sizes) if left_sizes else 0
-                lines.append(
-                    f"  Left dataset per partition:  "
-                    f"avg {self._format_bytes(int(left_avg))}, "
-                    f"max {self._format_bytes(left_max)}"
-                )
-            if right_sizes:
-                right_avg = statistics.mean(right_sizes) if right_sizes else 0
-                right_max = max(right_sizes) if right_sizes else 0
-                lines.append(
-                    f"  Right dataset per partition: "
-                    f"avg {self._format_bytes(int(right_avg))}, "
-                    f"max {self._format_bytes(right_max)}"
-                )
-            if self.estimated_output_size_bytes:
-                lines.append(
-                    f"  Estimated output size: "
-                    f"{self._format_bytes(self.estimated_output_size_bytes)}"
-                )
-            lines.append("")
-
-        # Per-aggregator memory breakdown (if available)
+        # Memory allocation - the key info users need
+        lines.append("Memory Allocation:")
         if self.per_aggregator_memory_bytes:
-            lines.append("Per-Aggregator Memory Allocation (ray.remote memory=...):")
-            lines.append("  Formula: (obj_store_in + obj_store_out + heap) * 1.15")
-            lines.append("  Floor: 1 GiB minimum per aggregator")
-            lines.append("")
-            total_allocated = sum(self.per_aggregator_memory_bytes.values())
+            total_mem = sum(self.per_aggregator_memory_bytes.values())
             min_mem = min(self.per_aggregator_memory_bytes.values())
             max_mem = max(self.per_aggregator_memory_bytes.values())
-            uniform_total = (
-                self.recommended_memory_per_aggregator * self.num_aggregators
+            lines.append(
+                f"  Total reserved: {self._format_bytes(total_mem)} "
+                f"for {self.num_aggregators} workers"
             )
-            # Only show savings comparison if meaningful (not dominated by floor)
-            if total_allocated < uniform_total:
-                savings_pct = (1 - total_allocated / uniform_total) * 100
+            if min_mem != max_mem:
                 lines.append(
-                    f"  Total allocated: {self._format_bytes(total_allocated)} "
-                    f"(vs {self._format_bytes(uniform_total)} uniform, "
-                    f"{savings_pct:.0f}% savings)"
+                    f"  Per worker: {self._format_bytes(min_mem)} to {self._format_bytes(max_mem)}"
                 )
-            elif min_mem == max_mem:
+            else:
+                lines.append(f"  Per worker: {self._format_bytes(min_mem)}")
+        else:
+            lines.append(
+                f"  Recommended per worker: "
+                f"{self._format_bytes(self.recommended_memory_per_aggregator)}"
+            )
+
+        # Cluster check - only show if there might be a problem
+        if self.memory_headroom_ratio < 2.0:
+            lines.append("")
+            if self.memory_headroom_ratio >= 1.0:
                 lines.append(
-                    f"  Total allocated: {self._format_bytes(total_allocated)} "
-                    f"(floor-dominated, all aggregators at minimum)"
+                    f"Cluster: {self._format_bytes(self.cluster_memory_available)} available "
+                    f"({self.memory_headroom_ratio:.1f}x headroom)"
                 )
             else:
                 lines.append(
-                    f"  Total allocated: {self._format_bytes(total_allocated)}"
+                    f"WARNING: Cluster may not have enough memory "
+                    f"({self._format_bytes(self.cluster_memory_available)} available, "
+                    f"need {self._format_bytes(self.total_required_memory)})"
                 )
-            lines.append(
-                f"  Per-aggregator range: [{self._format_bytes(min_mem)}, "
-                f"{self._format_bytes(max_mem)}]"
-            )
-            if (
-                self.per_aggregator_heap_bytes
-                and self.per_aggregator_object_store_bytes
-            ):
-                # Show breakdown for worst-case aggregator
-                wc_id = self.worst_case_aggregator.aggregator_id
-                wc_heap = self.per_aggregator_heap_bytes.get(wc_id, 0)
-                wc_obj_store = self.per_aggregator_object_store_bytes.get(wc_id, 0)
-                wc_total = self.per_aggregator_memory_bytes.get(wc_id, 0)
-                lines.append("")
-                lines.append(f"  Worst-case aggregator #{wc_id}:")
-                lines.append(
-                    f"    Object store (in+out): {self._format_bytes(wc_obj_store)}"
-                )
-                lines.append(f"    Heap (processing):    {self._format_bytes(wc_heap)}")
-                lines.append(
-                    f"    Total (with buffer):  {self._format_bytes(wc_total)}"
-                )
-            lines.append("")
 
-        # Recommendations
-        lines.append("Recommendations:")
-        memory_arg = self.recommended_ray_remote_args.get("memory", 0)
-        lines.append(f'  aggregator_ray_remote_args={{"memory": {memory_arg}}}')
-        lines.append("")
-
-        # Skew warnings
+        # Skew warnings - only show if there are warnings
         if self.skew_warnings:
-            lines.append("\u26a0 Skew Warnings:")
-            for warning in self.skew_warnings[:10]:
+            lines.append("")
+            lines.append("Skew warnings:")
+            for warning in self.skew_warnings[:5]:
                 lines.append(f"  {warning}")
-            if len(self.skew_warnings) > 10:
-                lines.append(f"  ... and {len(self.skew_warnings) - 10} more")
-        else:
-            lines.append("\u26a0 Skew Warnings:")
-            lines.append("  None (all partitions within 2x of mean)")
+            if len(self.skew_warnings) > 5:
+                lines.append(f"  ... and {len(self.skew_warnings) - 5} more")
 
         return "\n".join(lines)
 

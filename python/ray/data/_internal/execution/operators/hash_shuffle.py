@@ -3,6 +3,7 @@ import functools
 import itertools
 import logging
 import math
+import os
 import queue
 import random
 import statistics
@@ -80,6 +81,8 @@ from ray.data.context import (
     DataContext,
 )
 
+import psutil
+
 if typing.TYPE_CHECKING:
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
@@ -90,7 +93,7 @@ BlockTransformer = Callable[[Block], Block]
 
 
 DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY = env_integer(
-    "RAY_DATA_DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY", 8
+    "RAY_DATA_DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY", 1
 )
 
 DEFAULT_HASH_SHUFFLE_AGGREGATOR_MEMORY_ALLOCATION = env_integer(
@@ -1041,7 +1044,8 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             # Configure per-aggregator memory for efficient resource usage
             if estimate.per_aggregator_memory_bytes:
                 self._aggregator_pool.set_per_aggregator_memory(
-                    estimate.per_aggregator_memory_bytes
+                    estimate.per_aggregator_memory_bytes,
+                    estimate.per_aggregator_heap_bytes,
                 )
 
             self._memory_estimate = estimate
@@ -1221,7 +1225,12 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         # We include object store in the memory reservation because Ray doesn't
         # have fine-grained per-actor object store limits, and this ensures
         # aggregators have sufficient resources to avoid OOM.
-        MEMORY_FLOOR_BYTES = 1 * GiB
+        #
+        # Floor of 512 MiB accounts for:
+        # - Python process + Ray imports: ~160 MB
+        # - PyArrow/NumPy overhead: ~50 MB
+        # - Headroom for temp allocations: ~300 MB
+        MEMORY_FLOOR_BYTES = 512 * MiB
         per_aggregator_memory_bytes = {}
         per_aggregator_heap_bytes = {}
         per_aggregator_object_store_bytes = {}
@@ -1232,9 +1241,11 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             output_obj_store = agg_est.total_bytes
             total_obj_store = input_obj_store + output_obj_store
 
-            # Heap: ~10% of largest partition for shuffle (concat buffers)
-            # Join subclass overrides with 2x largest for hash tables
-            heap_for_processing = int(agg_est.largest_partition_bytes * 0.1)
+            # Heap memory for processing: Arrow operations create copies during
+            # concatenation and processing, plus allocator overhead. Empirically
+            # this is roughly 100% of the largest partition size.
+            # Join subclass overrides with higher multiplier for hash tables.
+            heap_for_processing = int(agg_est.largest_partition_bytes * 1.0)
 
             # Total = obj_store + heap + buffer
             required_memory = total_obj_store + heap_for_processing
@@ -1616,21 +1627,26 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             max_error = max(errors)
             avg_error = sum(errors) / len(errors)
 
-            # Strict mode: raise if any error > 1%
-            if ctx.strict_shuffle_estimation and max_error > 0.01:
+            # Partition size estimates should be exact because:
+            # 1. Estimation uses the same hash_partition() logic as actual shuffle
+            # 2. We scan all rows (no sampling)
+            # 3. We use Arrow's nbytes for consistent byte counting
+            # Any non-zero error indicates a bug in the estimation logic.
+            if ctx.strict_shuffle_estimation and max_error > 0:
                 raise RuntimeError(
-                    f"Shuffle estimation error {max_error:.2%} exceeds 1% threshold"
+                    f"Partition size estimation error: {max_error:.2%} "
+                    f"(expected exact match)"
                 )
 
             if max_error > 0.1:
                 logger.warning(
-                    f"Shuffle estimation validation: max error {max_error:.1%}, "
-                    f"avg error {avg_error:.1%}"
+                    f"Partition size estimation: predicted sizes differ from actual "
+                    f"by up to {max_error:.1%} (avg {avg_error:.1%})"
                 )
             else:
                 logger.info(
-                    f"Shuffle estimation validated: max error {max_error:.1%}, "
-                    f"avg error {avg_error:.1%}"
+                    f"Partition size estimation: predictions match actual sizes "
+                    f"(max error {max_error:.1%}, avg {avg_error:.1%})"
                 )
 
     def _handle_shuffled_block_metadata(
@@ -1965,8 +1981,13 @@ class AggregatorPool:
 
         # Per-aggregator memory from estimation (set via set_per_aggregator_memory)
         self._per_aggregator_memory_bytes: Optional[Dict[int, int]] = None
+        self._per_aggregator_heap_bytes: Optional[Dict[int, int]] = None
 
-    def set_per_aggregator_memory(self, memory_map: Dict[int, int]) -> None:
+    def set_per_aggregator_memory(
+        self,
+        memory_map: Dict[int, int],
+        heap_map: Optional[Dict[int, int]] = None,
+    ) -> None:
         """Set per-aggregator memory requirements from estimation.
 
         This should be called after memory estimation completes but before
@@ -1974,16 +1995,11 @@ class AggregatorPool:
         memory requirement rather than a uniform worst-case allocation.
 
         Args:
-            memory_map: Dict mapping aggregator_id -> memory in bytes
+            memory_map: Dict mapping aggregator_id -> total memory in bytes
+            heap_map: Optional dict mapping aggregator_id -> estimated heap bytes
         """
         self._per_aggregator_memory_bytes = memory_map
-        total_memory = sum(memory_map.values())
-        logger.info(
-            f"Using per-aggregator memory allocation: "
-            f"total={total_memory / GiB:.2f} GiB across {len(memory_map)} aggregators, "
-            f"range=[{min(memory_map.values()) / GiB:.2f}, "
-            f"{max(memory_map.values()) / GiB:.2f}] GiB"
-        )
+        self._per_aggregator_heap_bytes = heap_map
 
     def start(self):
         # Check cluster resources before starting aggregators
@@ -2147,7 +2163,31 @@ class AggregatorPool:
 
         return finalized_remote_args
 
+    def _collect_memory_stats(self) -> List[Dict[str, Any]]:
+        """Collect memory statistics from all aggregators (internal use).
+
+        Returns a list of memory stats dicts, one per aggregator, with:
+        - aggregator_id: The aggregator's ID
+        - baseline_bytes: Memory at actor init (Python/Ray overhead)
+        - peak_bytes: Peak USS memory observed during operation
+        - heap_used_bytes: Actual heap memory used for data processing
+
+        Note: Uses USS (Unique Set Size) which excludes shared memory
+        (including Ray's mmap'd object store).
+        """
+        if not self._aggregators:
+            return []
+
+        # Collect stats from all aggregators in parallel
+        stats_refs = [agg.get_memory_stats.remote() for agg in self._aggregators]
+        stats = ray.get(stats_refs)
+        return stats
+
     def shutdown(self, force: bool):
+        # Collect and log memory stats before shutdown (even if force=True)
+        if self._aggregators:
+            self._log_memory_stats()
+
         # Shutdown aggregators
         if force:
             for actor in self._aggregators:
@@ -2156,6 +2196,132 @@ class AggregatorPool:
                 ray.kill(actor)
 
         self._aggregators.clear()
+
+    def _log_memory_stats(self) -> None:
+        """Collect memory stats from aggregators and log comparison with estimates."""
+        try:
+            actual_stats = self._collect_memory_stats()
+            if not actual_stats:
+                return
+
+            # Compute summary statistics
+            total_actual_heap = sum(s.get("heap_used_bytes", 0) for s in actual_stats)
+            max_actual_heap = max(s.get("heap_used_bytes", 0) for s in actual_stats)
+            avg_baseline = sum(s.get("baseline_bytes", 0) for s in actual_stats) / len(
+                actual_stats
+            )
+
+            # Log actual memory usage
+            # "Heap" = memory used for data processing (excludes Ray object store)
+            # "Baseline" = Python/Ray overhead before any data processing
+            logger.info(
+                f"Shuffle worker memory usage: "
+                f"{total_actual_heap / MiB:.1f} MiB heap across {len(actual_stats)} workers "
+                f"(max {max_actual_heap / MiB:.1f} MiB per worker, "
+                f"baseline {avg_baseline / MiB:.0f} MiB)"
+            )
+
+            # Warn if max_concurrency > 1 (heap estimation assumes sequential processing)
+            max_concurrency = self._aggregator_ray_remote_args.get("max_concurrency", 1)
+            if max_concurrency > 1:
+                logger.warning(
+                    f"Heap estimation may be inaccurate: max_concurrency={max_concurrency} "
+                    f"allows {max_concurrency} partitions to finalize concurrently per worker. "
+                    f"Estimation assumes sequential processing (max_concurrency=1). "
+                    f"Set RAY_DATA_DEFAULT_HASH_SHUFFLE_AGGREGATOR_MAX_CONCURRENCY=1 for accurate estimation."
+                )
+
+            # Compare with estimates if available
+            if self._per_aggregator_heap_bytes:
+                total_estimated_heap = sum(self._per_aggregator_heap_bytes.values())
+
+                # =============================================================
+                # HEAP ESTIMATION LIMITATIONS
+                # =============================================================
+                # The heap memory estimate is based on partition sizes and assumes
+                # simple shuffle/concatenation operations. The estimate will be
+                # INACCURATE in these scenarios (documented for future improvement):
+                #
+                # 1. CONCURRENT FINALIZATION (max_concurrency > 1):
+                #    When max_concurrency > 1, multiple partitions can finalize
+                #    simultaneously, each consuming heap memory. Our estimate
+                #    assumes max_concurrency=1 (one partition at a time).
+                #    Impact: Could underestimate by up to max_concurrency factor.
+                #    Mitigation: Default max_concurrency changed to 1.
+                #
+                # 2. JOINS (not yet supported for heap estimation):
+                #    Join operations have additional memory requirements not
+                #    captured by partition size alone:
+                #    - Output explosion: If left has M rows with key "A" and right
+                #      has N rows with key "A", join produces M×N output rows.
+                #      Could underestimate by orders of magnitude.
+                #    - Non-streaming output: If join accumulates full output before
+                #      yielding (vs streaming blocks incrementally), heap includes
+                #      entire output size.
+                #    - Hash table overhead: Joins build hash tables with overhead
+                #      beyond raw data (buckets, indices). Could underestimate by
+                #      20-50%.
+                #
+                # 3. ARROW/ALLOCATOR FRAGMENTATION:
+                #    Memory allocators may hold onto freed memory, and Arrow's
+                #    memory pool behavior can vary. GC timing also affects
+                #    measurements.
+                #    Impact: Noisy measurements, typically within 50% of estimate.
+                #    Mitigation: 100% error threshold for validation.
+                # =============================================================
+
+                # Only validate heap if estimate is meaningful (> 1 MiB).
+                # For tiny datasets, relative error is meaningless since fixed
+                # Python/PyArrow overhead dominates.
+                MIN_HEAP_FOR_VALIDATION = 1 * MiB
+
+                if total_estimated_heap >= MIN_HEAP_FOR_VALIDATION:
+                    # Calculate relative error (same approach as partition validation)
+                    heap_error = (
+                        abs(total_actual_heap - total_estimated_heap)
+                        / total_estimated_heap
+                    )
+
+                    # Heap memory is noisier than partition sizes due to GC timing,
+                    # allocator behavior, and measurement variability. Use 100% threshold.
+                    # Over-estimation is less dangerous than under-estimation.
+                    HEAP_ERROR_THRESHOLD = 1.0
+
+                    ctx = DataContext.get_current()
+                    if heap_error <= HEAP_ERROR_THRESHOLD:
+                        logger.info(
+                            f"Heap memory estimation: predicted {total_estimated_heap / MiB:.1f} MiB, "
+                            f"actual {total_actual_heap / MiB:.1f} MiB (error {heap_error:.0%})"
+                        )
+                    else:
+                        direction = (
+                            "under"
+                            if total_actual_heap > total_estimated_heap
+                            else "over"
+                        )
+                        msg = (
+                            f"Heap memory estimation inaccurate: predicted "
+                            f"{total_estimated_heap / MiB:.1f} MiB but actually used "
+                            f"{total_actual_heap / MiB:.1f} MiB ({direction}-estimated by {heap_error:.0%}, "
+                            f"threshold is {HEAP_ERROR_THRESHOLD:.0%})"
+                        )
+                        if ctx.strict_shuffle_estimation:
+                            raise ValueError(msg)
+                        else:
+                            logger.warning(msg)
+                else:
+                    # Small dataset - heap validation not meaningful
+                    logger.info(
+                        f"Heap memory: {total_actual_heap / MiB:.1f} MiB used "
+                        f"(estimate {total_estimated_heap / MiB:.1f} MiB, validation skipped for small data)"
+                    )
+
+        except ValueError:
+            # Re-raise validation errors from strict mode
+            raise
+        except Exception as e:
+            # Don't fail shutdown if memory stats collection fails
+            logger.debug(f"Failed to collect memory stats: {e}")
 
     def check_aggregator_health(self) -> Optional[AggregatorHealthInfo]:
         """Get health information about aggregators for issue detection.
@@ -2231,6 +2397,7 @@ class HashShuffleAggregator:
     """
 
     _DEBUG_DUMP_PERIOD_S = 10
+    _MEMORY_SAMPLE_PERIOD_S = 1
 
     def __init__(
         self,
@@ -2269,12 +2436,43 @@ class HashShuffleAggregator:
             min_num_blocks_compaction_threshold,
         )
 
+        # Memory tracking: use USS (Unique Set Size) to exclude shared memory
+        # (including Ray's mmap'd object store) from heap measurements
+        self._process = psutil.Process(os.getpid())
+        self._baseline_memory_bytes = self._get_uss_memory()
+        self._peak_memory_bytes = self._baseline_memory_bytes
+        self._memory_samples: List[int] = []
+        self._memory_lock = threading.Lock()
+
         self._bg_thread = threading.Thread(
             target=self._debug_dump,
             name="hash_shuffle_aggregator_debug_dump",
             daemon=True,
         )
         self._bg_thread.start()
+
+    def _get_uss_memory(self) -> int:
+        """Get USS (Unique Set Size) memory, which excludes shared memory.
+
+        USS measures memory unique to this process and excludes:
+        - Shared libraries
+        - Memory-mapped files (including Ray's object store)
+
+        This provides a clean heap-only measurement.
+        """
+        try:
+            # memory_full_info() provides uss but is slightly slower than memory_info()
+            return self._process.memory_full_info().uss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0
+
+    def _sample_memory(self) -> None:
+        """Sample current memory and update peak if needed."""
+        current = self._get_uss_memory()
+        with self._memory_lock:
+            self._memory_samples.append(current)
+            if current > self._peak_memory_bytes:
+                self._peak_memory_bytes = current
 
     def submit(self, input_seq_id: int, partition_id: int, partition_shard: Block):
         """Accepts a partition shard for accumulation.
@@ -2312,6 +2510,8 @@ class HashShuffleAggregator:
 
             # For actual compaction we're releasing the lock
             compacted = self._aggregation.compact(to_compact)
+            # Sample memory after compaction (significant heap usage)
+            self._sample_memory()
             # Requeue compacted block back into the queue
             bucket.queue.put(compacted)
 
@@ -2343,6 +2543,8 @@ class HashShuffleAggregator:
             # Finalization happens outside the lock (doesn't block other partitions)
             # Convert dict to tuple ordered by sequence ID for finalize interface
             blocks = self._aggregation.finalize(partition_shards_map)
+            # Sample memory after finalization (significant heap usage during joins)
+            self._sample_memory()
         else:
             blocks = iter([])
 
@@ -2367,6 +2569,9 @@ class HashShuffleAggregator:
         while True:
             time.sleep(self._DEBUG_DUMP_PERIOD_S)
 
+            # Sample memory periodically
+            self._sample_memory()
+
             result = defaultdict(defaultdict)
 
             for seq_id, partition_map in list(
@@ -2379,9 +2584,41 @@ class HashShuffleAggregator:
                         "compaction_threshold": partition.compaction_threshold,
                     }
 
+            # Include memory stats in debug output
+            with self._memory_lock:
+                peak_mb = self._peak_memory_bytes / MiB
+                baseline_mb = self._baseline_memory_bytes / MiB
+                heap_used_mb = (
+                    self._peak_memory_bytes - self._baseline_memory_bytes
+                ) / MiB
+
             logger.debug(
-                f"Hash shuffle aggregator id={self._aggregator_id}, " f"state: {result}"
+                f"Hash shuffle aggregator id={self._aggregator_id}, "
+                f"memory: peak={peak_mb:.1f}MB, baseline={baseline_mb:.1f}MB, "
+                f"heap_used={heap_used_mb:.1f}MB, state: {result}"
             )
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Return memory statistics for this aggregator.
+
+        Returns a dict with:
+        - baseline_bytes: Memory at actor init (includes Python/Ray overhead)
+        - peak_bytes: Peak USS memory observed during operation
+        - heap_used_bytes: peak_bytes - baseline_bytes (actual heap for data)
+        - num_samples: Number of memory samples taken
+        - samples: List of all memory samples (for debugging)
+        """
+        self._sample_memory()  # Take final sample
+        with self._memory_lock:
+            return {
+                "aggregator_id": self._aggregator_id,
+                "baseline_bytes": self._baseline_memory_bytes,
+                "peak_bytes": self._peak_memory_bytes,
+                "heap_used_bytes": self._peak_memory_bytes
+                - self._baseline_memory_bytes,
+                "num_samples": len(self._memory_samples),
+                "samples": list(self._memory_samples),
+            }
 
     @staticmethod
     def _allocate_partition_buckets(
