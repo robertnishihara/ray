@@ -129,6 +129,19 @@ class HashAggregateOperator(HashShufflingOperatorBase):
     def _get_operator_num_cpus_override(self) -> float:
         return self.data_context.hash_aggregate_operator_actor_num_cpus_override
 
+    def _has_map_side_reduction(self) -> bool:
+        """Aggregation operators have map-side partial aggregation.
+
+        This means the actual shuffle data will be much smaller than the input
+        data because rows are partially aggregated (combined) before shuffling.
+        The reduction ratio depends on key cardinality:
+            actual_size ≈ input_size × (num_distinct_keys / num_rows)
+
+        For example, with 1 billion rows and 50K distinct keys:
+            reduction_ratio = 50K / 1B = 0.00005 (99.995% reduction)
+        """
+        return True
+
     @classmethod
     def _estimate_aggregator_memory_allocation(
         cls,

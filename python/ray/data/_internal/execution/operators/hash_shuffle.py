@@ -1593,8 +1593,28 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
     def _is_finalized(self):
         return len(self._pending_finalization_partition_ids) == 0
 
+    def _has_map_side_reduction(self) -> bool:
+        """Return True if this operator has map-side reduction (e.g., aggregation).
+
+        Subclasses with map-side combiners should override this to return True.
+        When True, the actual partition sizes will be smaller than estimated
+        because estimation is based on input data, not post-reduction data.
+        """
+        return False
+
     def _validate_estimates(self) -> None:
-        """Compare estimated vs actual partition sizes after shuffle completes."""
+        """Compare estimated vs actual partition sizes after shuffle completes.
+
+        Validation behavior depends on operator type:
+        - For repartition (no map-side reduction): Exact match expected (0% error)
+        - For aggregation (with map-side reduction): Upper bound validation
+          - actual <= estimated (estimate based on input, actual is reduced)
+          - actual >= expected_reduced (based on key cardinality)
+        - For join: Shuffle partition sizes should be exact
+
+        Upper bound violations indicate bugs. Lower bound violations for
+        aggregations might indicate sampling issues in cardinality estimation.
+        """
         from ray.data.context import DataContext
 
         if self._memory_estimate is None:
@@ -1614,6 +1634,101 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             for p in self._memory_estimate.partition_estimates
         }
 
+        total_estimated = sum(estimated_sizes.values())
+        total_actual = sum(actual_sizes.values())
+
+        has_reduction = self._has_map_side_reduction()
+
+        if has_reduction:
+            # For aggregation operators: validate upper bound
+            # Estimate is based on input data, actual is after map-side reduction
+            self._validate_aggregation_estimates(
+                ctx, estimated_sizes, actual_sizes, total_estimated, total_actual
+            )
+        else:
+            # For repartition/join shuffle: exact match expected
+            self._validate_exact_estimates(ctx, estimated_sizes, actual_sizes)
+
+    def _validate_aggregation_estimates(
+        self,
+        ctx,
+        estimated_sizes: Dict[int, int],
+        actual_sizes: Dict[int, int],
+        total_estimated: int,
+        total_actual: int,
+    ) -> None:
+        """Validate estimates for aggregation operators with map-side reduction.
+
+        For aggregations:
+        - Estimate is upper bound (based on input data)
+        - Actual will be smaller (after map-side partial aggregation)
+        - Expected reduction ratio ≈ key_cardinality / total_rows
+        """
+        # Check upper bound: actual should not exceed estimated (with small tolerance)
+        upper_bound_violations = []
+        for pid in range(self._num_partitions):
+            est = estimated_sizes.get(pid, 0)
+            act = actual_sizes.get(pid, 0)
+            if est > 0 and act > est * 1.05:  # 5% tolerance for rounding
+                violation_pct = (act - est) / est
+                upper_bound_violations.append((pid, est, act, violation_pct))
+
+        if upper_bound_violations and ctx.strict_shuffle_estimation:
+            worst = max(upper_bound_violations, key=lambda x: x[3])
+            raise RuntimeError(
+                f"Aggregation partition size exceeded estimate: partition {worst[0]} "
+                f"actual {worst[2]:,} > estimated {worst[1]:,} ({worst[3]:.1%} over). "
+                f"Estimate should be upper bound for aggregations."
+            )
+
+        # Compute reduction ratio
+        reduction_ratio = total_actual / total_estimated if total_estimated > 0 else 0
+
+        # Expected reduction based on key cardinality (if available)
+        key_cardinality = self._memory_estimate.key_cardinality
+        total_rows = self._memory_estimate.total_rows
+        expected_reduction_ratio = (
+            key_cardinality / total_rows
+            if total_rows > 0 and key_cardinality > 0
+            else 0
+        )
+
+        # Log the reduction information
+        if expected_reduction_ratio > 0:
+            logger.info(
+                f"Aggregation partition size validation: "
+                f"reduction ratio {reduction_ratio:.4f} "
+                f"(expected ~{expected_reduction_ratio:.4f} based on "
+                f"{key_cardinality:,} distinct keys / {total_rows:,} rows). "
+                f"Estimate is upper bound: {total_estimated:,} bytes, "
+                f"actual: {total_actual:,} bytes."
+            )
+
+            # Warn if reduction is much less than expected (might indicate
+            # cardinality sampling issues)
+            if (
+                reduction_ratio > expected_reduction_ratio * 10
+                and reduction_ratio > 0.1
+            ):
+                logger.warning(
+                    f"Aggregation reduction ({reduction_ratio:.2%}) is much higher than "
+                    f"expected ({expected_reduction_ratio:.2%}). This may indicate "
+                    f"key cardinality was underestimated due to sampling."
+                )
+        else:
+            logger.info(
+                f"Aggregation partition size validation: "
+                f"input {total_estimated:,} bytes reduced to {total_actual:,} bytes "
+                f"({reduction_ratio:.2%} of input). Estimate is upper bound."
+            )
+
+    def _validate_exact_estimates(
+        self,
+        ctx,
+        estimated_sizes: Dict[int, int],
+        actual_sizes: Dict[int, int],
+    ) -> None:
+        """Validate estimates for operators expecting exact match (repartition, join shuffle)."""
         errors = []
         for pid in range(self._num_partitions):
             est = estimated_sizes.get(pid, 0)
