@@ -1038,6 +1038,12 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                     f"Consider increasing cluster size or reducing num_partitions."
                 )
 
+            # Configure per-aggregator memory for efficient resource usage
+            if estimate.per_aggregator_memory_bytes:
+                self._aggregator_pool.set_per_aggregator_memory(
+                    estimate.per_aggregator_memory_bytes
+                )
+
             self._memory_estimate = estimate
 
         self._estimation_complete = True
@@ -1185,7 +1191,7 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         # Find worst-case aggregator
         worst_case_aggregator = max(aggregator_estimates, key=lambda a: a.total_bytes)
 
-        # Calculate memory requirements
+        # Calculate memory requirements (using worst-case for backward compatibility)
         aggregator_input_object_store_bytes = worst_case_aggregator.total_bytes
         aggregator_output_object_store_bytes = worst_case_aggregator.total_bytes
         aggregator_heap_memory_bytes = 0  # No heap memory for simple shuffle
@@ -1199,6 +1205,45 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         recommended_memory_per_aggregator = (
             required_memory_per_aggregator + buffer_memory_bytes
         )
+
+        # Compute per-aggregator memory requirements
+        #
+        # Memory formula per aggregator:
+        #   memory = (input_obj_store + output_obj_store + heap) * (1 + buffer_ratio)
+        #   memory = max(memory, 1 GiB floor)
+        #
+        # Where:
+        #   input_obj_store = SUM of assigned partition sizes (data received)
+        #   output_obj_store = SUM of assigned partition sizes (data produced)
+        #   heap = 10% of largest partition (shuffle) or 2x largest (join)
+        #   buffer_ratio = 15% safety margin
+        #
+        # We include object store in the memory reservation because Ray doesn't
+        # have fine-grained per-actor object store limits, and this ensures
+        # aggregators have sufficient resources to avoid OOM.
+        MEMORY_FLOOR_BYTES = 1 * GiB
+        per_aggregator_memory_bytes = {}
+        per_aggregator_heap_bytes = {}
+        per_aggregator_object_store_bytes = {}
+
+        for agg_est in aggregator_estimates:
+            # Object store: input + output
+            input_obj_store = agg_est.total_bytes
+            output_obj_store = agg_est.total_bytes
+            total_obj_store = input_obj_store + output_obj_store
+
+            # Heap: ~10% of largest partition for shuffle (concat buffers)
+            # Join subclass overrides with 2x largest for hash tables
+            heap_for_processing = int(agg_est.largest_partition_bytes * 0.1)
+
+            # Total = obj_store + heap + buffer
+            required_memory = total_obj_store + heap_for_processing
+            with_buffer = int(required_memory * (1 + DEFAULT_ESTIMATION_BUFFER_RATIO))
+            final_memory = max(with_buffer, MEMORY_FLOOR_BYTES)
+
+            per_aggregator_memory_bytes[agg_est.aggregator_id] = final_memory
+            per_aggregator_heap_bytes[agg_est.aggregator_id] = heap_for_processing
+            per_aggregator_object_store_bytes[agg_est.aggregator_id] = total_obj_store
 
         # Get cluster resources
         try:
@@ -1253,6 +1298,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             memory_headroom_ratio=memory_headroom_ratio,
             # Configuration
             recommended_ray_remote_args={"memory": recommended_memory_per_aggregator},
+            per_aggregator_memory_bytes=per_aggregator_memory_bytes,
+            per_aggregator_heap_bytes=per_aggregator_heap_bytes,
+            per_aggregator_object_store_bytes=per_aggregator_object_store_bytes,
             # Join-specific (not applicable for shuffle)
             left_bytes_per_partition=None,
             right_bytes_per_partition=None,
@@ -1915,6 +1963,28 @@ class AggregatorPool:
             min_max_shards_compaction_thresholds
         )
 
+        # Per-aggregator memory from estimation (set via set_per_aggregator_memory)
+        self._per_aggregator_memory_bytes: Optional[Dict[int, int]] = None
+
+    def set_per_aggregator_memory(self, memory_map: Dict[int, int]) -> None:
+        """Set per-aggregator memory requirements from estimation.
+
+        This should be called after memory estimation completes but before
+        start() is called. Each aggregator will be created with its specific
+        memory requirement rather than a uniform worst-case allocation.
+
+        Args:
+            memory_map: Dict mapping aggregator_id -> memory in bytes
+        """
+        self._per_aggregator_memory_bytes = memory_map
+        total_memory = sum(memory_map.values())
+        logger.info(
+            f"Using per-aggregator memory allocation: "
+            f"total={total_memory / GiB:.2f} GiB across {len(memory_map)} aggregators, "
+            f"range=[{min(memory_map.values()) / GiB:.2f}, "
+            f"{max(memory_map.values()) / GiB:.2f}] GiB"
+        )
+
     def start(self):
         # Check cluster resources before starting aggregators
         self._check_cluster_resources()
@@ -1929,9 +1999,14 @@ class AggregatorPool:
 
             assert len(target_partition_ids) > 0
 
-            aggregator = HashShuffleAggregator.options(
-                **self._aggregator_ray_remote_args
-            ).remote(
+            # Use per-aggregator memory if available from estimation
+            remote_args = self._aggregator_ray_remote_args.copy()
+            if self._per_aggregator_memory_bytes is not None:
+                agg_memory = self._per_aggregator_memory_bytes.get(aggregator_id)
+                if agg_memory is not None:
+                    remote_args["memory"] = agg_memory
+
+            aggregator = HashShuffleAggregator.options(**remote_args).remote(
                 aggregator_id,
                 self._num_input_seqs,
                 target_partition_ids,

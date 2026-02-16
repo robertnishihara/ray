@@ -160,6 +160,13 @@ class ShuffleMemoryEstimate:
     # Ready-to-use configuration
     recommended_ray_remote_args: Dict[str, Any]
 
+    # Per-aggregator memory (computed from actual partition assignments)
+    # Maps aggregator_id -> memory in bytes
+    per_aggregator_memory_bytes: Dict[int, int] = field(default_factory=dict)
+    # Breakdown for observability:
+    per_aggregator_heap_bytes: Dict[int, int] = field(default_factory=dict)
+    per_aggregator_object_store_bytes: Dict[int, int] = field(default_factory=dict)
+
     # Join-specific fields
     left_bytes_per_partition: Optional[List[int]] = None
     right_bytes_per_partition: Optional[List[int]] = None
@@ -323,6 +330,59 @@ class ShuffleMemoryEstimate:
                 lines.append(
                     f"  Estimated output size: "
                     f"{self._format_bytes(self.estimated_output_size_bytes)}"
+                )
+            lines.append("")
+
+        # Per-aggregator memory breakdown (if available)
+        if self.per_aggregator_memory_bytes:
+            lines.append("Per-Aggregator Memory Allocation (ray.remote memory=...):")
+            lines.append("  Formula: (obj_store_in + obj_store_out + heap) * 1.15")
+            lines.append("  Floor: 1 GiB minimum per aggregator")
+            lines.append("")
+            total_allocated = sum(self.per_aggregator_memory_bytes.values())
+            min_mem = min(self.per_aggregator_memory_bytes.values())
+            max_mem = max(self.per_aggregator_memory_bytes.values())
+            uniform_total = (
+                self.recommended_memory_per_aggregator * self.num_aggregators
+            )
+            # Only show savings comparison if meaningful (not dominated by floor)
+            if total_allocated < uniform_total:
+                savings_pct = (1 - total_allocated / uniform_total) * 100
+                lines.append(
+                    f"  Total allocated: {self._format_bytes(total_allocated)} "
+                    f"(vs {self._format_bytes(uniform_total)} uniform, "
+                    f"{savings_pct:.0f}% savings)"
+                )
+            elif min_mem == max_mem:
+                lines.append(
+                    f"  Total allocated: {self._format_bytes(total_allocated)} "
+                    f"(floor-dominated, all aggregators at minimum)"
+                )
+            else:
+                lines.append(
+                    f"  Total allocated: {self._format_bytes(total_allocated)}"
+                )
+            lines.append(
+                f"  Per-aggregator range: [{self._format_bytes(min_mem)}, "
+                f"{self._format_bytes(max_mem)}]"
+            )
+            if (
+                self.per_aggregator_heap_bytes
+                and self.per_aggregator_object_store_bytes
+            ):
+                # Show breakdown for worst-case aggregator
+                wc_id = self.worst_case_aggregator.aggregator_id
+                wc_heap = self.per_aggregator_heap_bytes.get(wc_id, 0)
+                wc_obj_store = self.per_aggregator_object_store_bytes.get(wc_id, 0)
+                wc_total = self.per_aggregator_memory_bytes.get(wc_id, 0)
+                lines.append("")
+                lines.append(f"  Worst-case aggregator #{wc_id}:")
+                lines.append(
+                    f"    Object store (in+out): {self._format_bytes(wc_obj_store)}"
+                )
+                lines.append(f"    Heap (processing):    {self._format_bytes(wc_heap)}")
+                lines.append(
+                    f"    Total (with buffer):  {self._format_bytes(wc_total)}"
                 )
             lines.append("")
 
