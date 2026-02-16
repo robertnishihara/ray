@@ -1536,8 +1536,12 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
 
     def _validate_estimates(self) -> None:
         """Compare estimated vs actual partition sizes after shuffle completes."""
+        from ray.data.context import DataContext
+
         if self._memory_estimate is None:
             return
+
+        ctx = DataContext.get_current()
 
         # Build actual sizes from self._partitions_stats
         actual_sizes: Dict[int, int] = defaultdict(int)
@@ -1556,21 +1560,29 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             est = estimated_sizes.get(pid, 0)
             act = actual_sizes.get(pid, 0)
             if est > 0:
-                error = abs(act - est) / est
-                errors.append(error)
+                errors.append(abs(act - est) / est)
+            elif act > 0:
+                errors.append(1.0)  # Estimated 0 but got non-zero
 
         if errors:
             max_error = max(errors)
             avg_error = sum(errors) / len(errors)
-            if max_error > 0.1:  # >10% error
+
+            # Strict mode: raise if any error > 1%
+            if ctx.strict_shuffle_estimation and max_error > 0.01:
+                raise RuntimeError(
+                    f"Shuffle estimation error {max_error:.2%} exceeds 1% threshold"
+                )
+
+            if max_error > 0.1:
                 logger.warning(
-                    f"Shuffle estimation validation: max partition size error "
-                    f"was {max_error:.1%}, avg error was {avg_error:.1%}"
+                    f"Shuffle estimation validation: max error {max_error:.1%}, "
+                    f"avg error {avg_error:.1%}"
                 )
             else:
                 logger.info(
-                    f"Shuffle estimation validated: max partition size error "
-                    f"was {max_error:.1%}, avg error was {avg_error:.1%}"
+                    f"Shuffle estimation validated: max error {max_error:.1%}, "
+                    f"avg error {avg_error:.1%}"
                 )
 
     def _handle_shuffled_block_metadata(

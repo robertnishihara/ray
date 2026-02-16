@@ -144,6 +144,12 @@ DEFAULT_ENABLE_RICH_PROGRESS_BARS = bool(
 
 DEFAULT_ENFORCE_SCHEMAS = env_bool("RAY_DATA_ENFORCE_SCHEMAS", False)
 
+# When enabled, raises an exception if shuffle memory estimates differ from actual
+# partition sizes by more than a threshold. Useful for testing estimation accuracy.
+DEFAULT_STRICT_SHUFFLE_ESTIMATION = env_bool(
+    "RAY_DATA_STRICT_SHUFFLE_ESTIMATION", False
+)
+
 DEFAULT_ENABLE_GET_OBJECT_LOCATIONS_FOR_METRICS = False
 
 
@@ -622,6 +628,7 @@ class DataContext:
     enable_auto_log_stats: bool = DEFAULT_AUTO_LOG_STATS
     verbose_stats_logs: bool = DEFAULT_VERBOSE_STATS_LOG
     trace_allocations: bool = DEFAULT_TRACE_ALLOCATIONS
+    strict_shuffle_estimation: bool = DEFAULT_STRICT_SHUFFLE_ESTIMATION
     execution_options: "ExecutionOptions" = field(
         default_factory=_execution_options_factory
     )
