@@ -1,0 +1,16 @@
+name: shuffle-estimation-large-test
+
+containerfile: Containerfile
+
+working_dir: .
+
+# Compute config: 16x m5.4xlarge (16 vCPU, 64GB each = 1TB total)
+compute_config:
+  head_node:
+    instance_type: m5.4xlarge
+  worker_nodes:
+    - instance_type: m5.4xlarge
+      min_nodes: 15
+      max_nodes: 15
+
+entrypoint: python large_scale_test.py

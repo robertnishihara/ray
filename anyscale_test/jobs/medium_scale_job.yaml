@@ -1,0 +1,24 @@
+name: shuffle-estimation-medium-test
+description: Medium scale test (10GB) for shuffle memory estimation
+
+# Build image with our patched Ray code
+containerfile: anyscale_test/jobs/Containerfile
+
+# Compute config: 8x m5.2xlarge (8 vCPU, 32GB each = 256GB total)
+compute_config:
+  head_node:
+    instance_type: m5.2xlarge
+  worker_nodes:
+    - instance_type: m5.2xlarge
+      min_nodes: 7
+      max_nodes: 7
+
+# Working directory - repo root so Containerfile can access python/ray/*
+working_dir: ../..
+
+entrypoint: python anyscale_test/jobs/medium_scale_test.py
+
+# 30 minute timeout
+timeout_s: 1800
+
+max_retries: 0

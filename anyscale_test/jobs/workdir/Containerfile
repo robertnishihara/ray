@@ -1,0 +1,25 @@
+FROM anyscale/ray:2.44.1-py311
+
+ENV ANYSCALE_DISABLE_OPTIMIZED_RAY=1
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
+USER root
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+USER ray
+
+WORKDIR /home/ray
+
+# Install Ray nightly to get compatible base APIs
+RUN pip install -U "ray[default] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp311-cp311-manylinux2014_x86_64.whl"
+
+# Clone the feature branch with our shuffle estimation changes
+RUN git clone --depth 1 --branch feature/data-joins https://github.com/robertnishihara/ray.git ray-dev
+
+# Only patch shuffle-specific files (not context.py or dataset.py to avoid API conflicts)
+RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    cp /home/ray/ray-dev/python/ray/data/_internal/shuffle_memory_estimate.py $SITE_PACKAGES/ray/data/_internal/ && \
+    cp /home/ray/ray-dev/python/ray/data/_internal/shuffle_memory_estimator.py $SITE_PACKAGES/ray/data/_internal/ && \
+    cp /home/ray/ray-dev/python/ray/data/_internal/execution/operators/hash_shuffle.py $SITE_PACKAGES/ray/data/_internal/execution/operators/ && \
+    cp /home/ray/ray-dev/python/ray/data/_internal/execution/operators/hash_aggregate.py $SITE_PACKAGES/ray/data/_internal/execution/operators/
+
+WORKDIR /home/ray

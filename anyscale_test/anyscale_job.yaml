@@ -1,0 +1,26 @@
+# Anyscale job configuration for testing shuffle memory estimation
+name: test-shuffle-memory-estimate
+
+# Use the containerfile to build the image
+image_uri: null  # Will be built from containerfile
+containerfile: Dockerfile
+
+# Entry point
+entrypoint: python test_shuffle_estimate.py
+
+# Working directory (where test script is located)
+working_dir: .
+
+# Compute configuration - uses default cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: m5.xlarge
+  worker_nodes: []  # No workers needed for this test
+
+# Environment variables
+env_vars:
+  ANYSCALE_DISABLE_OPTIMIZED_RAY: "1"
+
+# Max retries
+max_retries: 0

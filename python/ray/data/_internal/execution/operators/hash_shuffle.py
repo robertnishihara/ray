@@ -785,6 +785,14 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         self._total_estimation_tasks: int = 0
         # Whether all inputs have been received
         self._all_inputs_received: bool = False
+        # Track estimation timing
+        self._estimation_start_time: Optional[float] = None
+        # Whether user provided explicit memory override
+        self._user_memory_override: Optional[int] = (
+            aggregator_ray_remote_args_override.get("memory")
+            if aggregator_ray_remote_args_override
+            else None
+        )
 
     def start(self, options: ExecutionOptions) -> None:
         super().start(options)
@@ -819,11 +827,20 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
 
         Uses callback-based tracking to avoid blocking the executor thread.
         """
+        import time
+
         input_key_column_names = self._key_column_names[input_index]
 
         # Skip estimation if no key columns (round-robin case)
         if not input_key_column_names:
             return
+
+        # Log when estimation starts (on first estimation task)
+        if self._estimation_start_time is None:
+            self._estimation_start_time = time.time()
+            logger.info(
+                f"Starting partition size estimation for {self._num_partitions} partitions..."
+            )
 
         for block_ref in input_bundle.block_refs:
             estimation_ref = _estimate_partition_sizes.remote(
@@ -1012,6 +1029,8 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         - All inputs have been received
         - All estimation tasks have completed
         """
+        import time
+
         if self._estimation_complete:
             return
 
@@ -1023,6 +1042,15 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         # Can only complete if all inputs received AND all estimation done
         if not (self._all_inputs_received and all_estimation_done):
             return
+
+        # Log estimation duration
+        estimation_duration = None
+        if self._estimation_start_time is not None:
+            estimation_duration = time.time() - self._estimation_start_time
+            logger.info(
+                f"Partition size estimation completed in {estimation_duration:.1f}s "
+                f"(note: may be bottlenecked by upstream operators)"
+            )
 
         # All estimation tasks are done - build and print the estimate
         if self._estimation_results:
@@ -1042,7 +1070,23 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
                 )
 
             # Configure per-aggregator memory for efficient resource usage
-            if estimate.per_aggregator_memory_bytes:
+            # User-provided memory override takes precedence
+            if self._user_memory_override is not None:
+                logger.info(
+                    f"Using user-provided memory override: "
+                    f"{estimate._format_bytes(self._user_memory_override)} per actor "
+                    f"(estimated: {estimate._format_bytes(estimate.recommended_memory_per_aggregator)})"
+                )
+                # Still set heap bytes for proper memory accounting within actor
+                if estimate.per_aggregator_heap_bytes:
+                    self._aggregator_pool.set_per_aggregator_memory(
+                        {
+                            aid: self._user_memory_override
+                            for aid in range(self._aggregator_pool.num_aggregators)
+                        },
+                        estimate.per_aggregator_heap_bytes,
+                    )
+            elif estimate.per_aggregator_memory_bytes:
                 self._aggregator_pool.set_per_aggregator_memory(
                     estimate.per_aggregator_memory_bytes,
                     estimate.per_aggregator_heap_bytes,

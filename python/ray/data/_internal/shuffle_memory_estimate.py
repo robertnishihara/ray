@@ -184,8 +184,12 @@ class ShuffleMemoryEstimate:
         else:
             return f"{size_bytes / 1024:.1f} KiB"
 
-    def summary(self) -> str:
+    def summary(self, include_details: bool = True) -> str:
         """Generate a human-readable summary of the memory estimation.
+
+        Args:
+            include_details: If True, include detailed breakdown of memory
+                components and skew statistics.
 
         Returns:
             A formatted string containing key statistics, skew analysis,
@@ -201,42 +205,85 @@ class ShuffleMemoryEstimate:
             f"Input: {self.total_rows:,} rows, {self._format_bytes(self.total_bytes)}"
         )
         lines.append(
-            f"Output: {self.num_partitions} partitions across {self.num_aggregators} workers"
+            f"Output: {self.num_partitions} partitions across {self.num_aggregators} actors"
         )
-        lines.append("")
 
-        # Data distribution - only show if there's skew
-        if self.skew_factor > 1.5 or self.empty_partition_count > 0:
-            lines.append("Data Distribution:")
-            if self.skew_factor > 1.5:
-                lines.append(
-                    f"  Skew detected: largest partition is {self.skew_factor:.1f}x the average"
-                )
+        # Partition size distribution (always show for observability)
+        if include_details:
+            lines.append("")
+            lines.append("Partition Size Distribution:")
+            lines.append(
+                f"  Min: {self._format_bytes(self.partition_size_min_bytes)}  "
+                f"p50: {self._format_bytes(self.partition_size_percentiles.get(50, 0))}"
+            )
+            lines.append(
+                f"  Max: {self._format_bytes(self.partition_size_max_bytes)}  "
+                f"p90: {self._format_bytes(self.partition_size_percentiles.get(90, 0))}"
+            )
+            lines.append(
+                f"  Mean: {self._format_bytes(int(self.partition_size_mean_bytes))}  "
+                f"p99: {self._format_bytes(self.partition_size_percentiles.get(99, 0))}"
+            )
             if self.empty_partition_count > 0:
                 lines.append(
                     f"  Empty partitions: {self.empty_partition_count} of {self.num_partitions}"
                 )
-            lines.append("")
+            lines.append(f"  Skew factor: {self.skew_factor:.2f}x (max/mean)")
+
+        # Memory breakdown with formula explanation
+        lines.append("")
+        lines.append("Memory Requirements (per actor, worst-case):")
+        lines.append(
+            f"  Object store (input):  {self._format_bytes(self.aggregator_input_object_store_bytes)}"
+        )
+        if self.aggregator_heap_memory_bytes > 0:
+            if self.is_join:
+                lines.append(
+                    f"  Heap (join tables):    {self._format_bytes(self.aggregator_heap_memory_bytes)}"
+                    f"  (2x largest partition for Arrow join)"
+                )
+            else:
+                lines.append(
+                    f"  Heap (aggregation):    {self._format_bytes(self.aggregator_heap_memory_bytes)}"
+                    f"  (1x largest partition for state)"
+                )
+        lines.append(
+            f"  Object store (output): {self._format_bytes(self.aggregator_output_object_store_bytes)}"
+        )
+        lines.append("  ─────────────────────────────")
+        lines.append(
+            f"  Required:     {self._format_bytes(self.required_memory_per_aggregator)}"
+        )
+        lines.append(
+            f"  Buffer ({int(self._buffer_ratio * 100)}%): "
+            f"{self._format_bytes(self.buffer_memory_bytes)}  "
+            f"(for fragmentation/temp allocations)"
+        )
+        lines.append(
+            f"  Recommended:  {self._format_bytes(self.recommended_memory_per_aggregator)}"
+        )
 
         # Memory allocation - the key info users need
-        lines.append("Memory Allocation:")
+        lines.append("")
+        lines.append("Actor Memory Configuration:")
         if self.per_aggregator_memory_bytes:
             total_mem = sum(self.per_aggregator_memory_bytes.values())
             min_mem = min(self.per_aggregator_memory_bytes.values())
             max_mem = max(self.per_aggregator_memory_bytes.values())
             lines.append(
                 f"  Total reserved: {self._format_bytes(total_mem)} "
-                f"for {self.num_aggregators} workers"
+                f"for {self.num_aggregators} actors"
             )
             if min_mem != max_mem:
                 lines.append(
-                    f"  Per worker: {self._format_bytes(min_mem)} to {self._format_bytes(max_mem)}"
+                    f"  Per actor: {self._format_bytes(min_mem)} to {self._format_bytes(max_mem)}"
                 )
             else:
-                lines.append(f"  Per worker: {self._format_bytes(min_mem)}")
+                lines.append(f"  Per actor: {self._format_bytes(min_mem)}")
+            lines.append("  Formula: input_bytes + heap_bytes + output_bytes + buffer")
         else:
             lines.append(
-                f"  Recommended per worker: "
+                f"  Recommended per actor: "
                 f"{self._format_bytes(self.recommended_memory_per_aggregator)}"
             )
 
@@ -258,7 +305,7 @@ class ShuffleMemoryEstimate:
         # Skew warnings - only show if there are warnings
         if self.skew_warnings:
             lines.append("")
-            lines.append("Skew warnings:")
+            lines.append("Skew Warnings (partitions >2x mean):")
             for warning in self.skew_warnings[:5]:
                 lines.append(f"  {warning}")
             if len(self.skew_warnings) > 5:
