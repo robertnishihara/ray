@@ -397,6 +397,15 @@ class JoinOperator(HashShufflingOperatorBase):
     def _get_operator_num_cpus_override(self) -> float:
         return self.data_context.join_operator_actor_num_cpus_override
 
+    def _get_heap_multiplier(self) -> float:
+        """Return 2.0x heap multiplier for join operations.
+
+        Joins require additional heap memory for hash table construction
+        during the in-memory join phase. Empirically, this is roughly
+        200% (2x) of the largest partition size.
+        """
+        return 2.0
+
     @classmethod
     def _estimate_aggregator_memory_allocation(
         cls,

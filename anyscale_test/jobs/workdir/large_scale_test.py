@@ -108,7 +108,7 @@ def run_join_test(num_rows_per_side: int, num_partitions: int):
     print("\nCreating left dataset...")
     left = ray.data.range(num_rows_per_side).map(
         lambda row: {
-            "join_key": row["id"] % 100000,  # 100K distinct keys
+            "join_key": row["id"],  # Unique key per row for 1:1 join
             "left_value": row["id"],
             "left_data": f"left_{row['id'] % 100000:06d}",
         }
@@ -117,7 +117,7 @@ def run_join_test(num_rows_per_side: int, num_partitions: int):
     print("Creating right dataset...")
     right = ray.data.range(num_rows_per_side).map(
         lambda row: {
-            "join_key": row["id"] % 100000,  # Same 100K keys
+            "join_key": row["id"],  # Same unique keys for 1:1 join
             "right_value": row["id"] * 2,
             "right_data": f"right_{row['id'] % 100000:06d}",
         }
@@ -148,10 +148,9 @@ def run_join_test(num_rows_per_side: int, num_partitions: int):
     print(f"  Output rows: {result_count:,}")
     print(f"  Throughput: {total_bytes / (1024**3) / total_time:.2f} GB/s")
 
-    # With uniform distribution: each key appears num_rows/100K times on each side
-    # So output = 100K keys * (num_rows/100K)^2 = num_rows^2 / 100K
-    expected_rows = num_rows_per_side  # For 1:1 key ratio
-    print(f"  Expected ~{expected_rows:,} rows (1:1 key ratio)")
+    # With unique keys, each row matches exactly one row on the other side
+    expected_rows = num_rows_per_side  # 1:1 join
+    print(f"  Expected ~{expected_rows:,} rows (1:1 join)")
 
     return total_time
 

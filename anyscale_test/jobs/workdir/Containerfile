@@ -13,7 +13,9 @@ WORKDIR /home/ray
 RUN pip install -U "ray[default] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp311-cp311-manylinux2014_x86_64.whl"
 
 # Clone the feature branch with our shuffle estimation changes
-RUN git clone --depth 1 --branch feature/data-joins https://github.com/robertnishihara/ray.git ray-dev
+# Cache bust: 2026-02-16-v2 (includes groupby fix and observability improvements)
+RUN git clone --depth 1 --branch feature/data-joins https://github.com/robertnishihara/ray.git ray-dev && \
+    cd ray-dev && git log --oneline -1
 
 # Only patch shuffle-specific files (not context.py or dataset.py to avoid API conflicts)
 RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \

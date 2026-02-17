@@ -1242,10 +1242,15 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         # Calculate memory requirements (using worst-case for backward compatibility)
         aggregator_input_object_store_bytes = worst_case_aggregator.total_bytes
         aggregator_output_object_store_bytes = worst_case_aggregator.total_bytes
-        aggregator_heap_memory_bytes = 0  # No heap memory for simple shuffle
+        # Heap memory: multiplier * largest partition (1.0x shuffle, 2.0x join)
+        aggregator_heap_memory_bytes = int(
+            worst_case_aggregator.largest_partition_bytes * self._get_heap_multiplier()
+        )
 
         required_memory_per_aggregator = (
-            aggregator_input_object_store_bytes + aggregator_output_object_store_bytes
+            aggregator_input_object_store_bytes
+            + aggregator_output_object_store_bytes
+            + aggregator_heap_memory_bytes
         )
         buffer_memory_bytes = int(
             required_memory_per_aggregator * DEFAULT_ESTIMATION_BUFFER_RATIO
@@ -1263,7 +1268,7 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         # Where:
         #   input_obj_store = SUM of assigned partition sizes (data received)
         #   output_obj_store = SUM of assigned partition sizes (data produced)
-        #   heap = 10% of largest partition (shuffle) or 2x largest (join)
+        #   heap = 1x largest partition (shuffle) or 2x largest (join)
         #   buffer_ratio = 15% safety margin
         #
         # We include object store in the memory reservation because Ray doesn't
@@ -1286,10 +1291,13 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
             total_obj_store = input_obj_store + output_obj_store
 
             # Heap memory for processing: Arrow operations create copies during
-            # concatenation and processing, plus allocator overhead. Empirically
-            # this is roughly 100% of the largest partition size.
-            # Join subclass overrides with higher multiplier for hash tables.
-            heap_for_processing = int(agg_est.largest_partition_bytes * 1.0)
+            # concatenation and processing, plus allocator overhead.
+            # Default is 1.0x (100%) of largest partition size.
+            # Join operators override _get_heap_multiplier() to return 2.0x
+            # for hash table construction overhead.
+            heap_for_processing = int(
+                agg_est.largest_partition_bytes * self._get_heap_multiplier()
+            )
 
             # Total = obj_store + heap + buffer
             required_memory = total_obj_store + heap_for_processing
@@ -1645,6 +1653,17 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         because estimation is based on input data, not post-reduction data.
         """
         return False
+
+    def _get_heap_multiplier(self) -> float:
+        """Return the heap memory multiplier for this operator.
+
+        The heap multiplier determines how much heap memory is allocated per
+        partition for in-memory processing (Arrow operations, concatenation, etc.).
+
+        Default is 1.0x (100% of largest partition size).
+        Join operators override this to 2.0x for hash table construction overhead.
+        """
+        return 1.0
 
     def _validate_estimates(self) -> None:
         """Compare estimated vs actual partition sizes after shuffle completes.

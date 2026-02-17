@@ -325,13 +325,16 @@ def estimate_shuffle_memory(
     worst_case_aggregator = max(aggregator_estimates, key=lambda a: a.total_bytes)
 
     # Calculate memory requirements for shuffle
-    # For shuffle: input + output object store
+    # For shuffle: input + output object store + heap for Arrow operations
     aggregator_input_object_store_bytes = worst_case_aggregator.total_bytes
     aggregator_output_object_store_bytes = worst_case_aggregator.total_bytes
-    aggregator_heap_memory_bytes = 0  # No heap memory needed for simple shuffle
+    # Heap memory: 1.0x largest partition for Arrow concatenation/processing
+    aggregator_heap_memory_bytes = worst_case_aggregator.largest_partition_bytes
 
     required_memory_per_aggregator = (
-        aggregator_input_object_store_bytes + aggregator_output_object_store_bytes
+        aggregator_input_object_store_bytes
+        + aggregator_output_object_store_bytes
+        + aggregator_heap_memory_bytes
     )
     buffer_memory_bytes = int(required_memory_per_aggregator * buffer_ratio)
     recommended_memory_per_aggregator = (

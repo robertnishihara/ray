@@ -95,16 +95,16 @@ class TestShuffleMemoryEstimate:
             skew_warnings=[],
             aggregator_estimates=aggregator_estimates,
             worst_case_aggregator=aggregator_estimates[1],
-            aggregator_heap_memory_bytes=0,
+            aggregator_heap_memory_bytes=4000,  # 1.0x largest partition (4000)
             aggregator_input_object_store_bytes=6000,
             aggregator_output_object_store_bytes=6000,
-            required_memory_per_aggregator=12000,
-            buffer_memory_bytes=1800,
-            recommended_memory_per_aggregator=13800,
+            required_memory_per_aggregator=16000,  # 6000 + 6000 + 4000
+            buffer_memory_bytes=2400,  # 15% of 16000
+            recommended_memory_per_aggregator=18400,  # 16000 + 2400
             cluster_memory_available=1000000000,
-            total_required_memory=24000,
-            memory_headroom_ratio=41666.67,
-            recommended_ray_remote_args={"memory": 13800},
+            total_required_memory=32000,  # 16000 * 2 aggregators
+            memory_headroom_ratio=31250.0,  # 1000000000 / 32000
+            recommended_ray_remote_args={"memory": 18400},
         )
 
     def test_summary_output(self, sample_estimate):
@@ -128,7 +128,7 @@ class TestShuffleMemoryEstimate:
         assert d["num_aggregators"] == 2
         assert len(d["partition_estimates"]) == 4
         assert len(d["aggregator_estimates"]) == 2
-        assert d["recommended_memory_per_aggregator"] == 13800
+        assert d["recommended_memory_per_aggregator"] == 18400
         assert d["is_join"] is False
 
     def test_repr(self, sample_estimate):
