@@ -27,14 +27,22 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <dirent.h>
+#include <semaphore.h>
+#include <sys/syscall.h>
+#include <time.h>
+#endif
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -107,6 +115,155 @@ std::ostream &operator<<(std::ostream &os, const StackTrace &stack_trace) {
 #endif
 
   return os;
+}
+
+#if defined(__linux__)
+namespace {
+
+// A deleter usable with std::unique_ptr to free() malloc'ed memory.
+struct FreeDeleter {
+  void operator()(void *ptr) const { free(ptr); }
+};
+
+constexpr int kMaxThreadDumpFrames = 64;
+
+// Signal used to ask a thread to capture its own stack. SIGURG is ignored by
+// default and is not otherwise used by the raylet (boost::asio's signal_set and
+// absl's failure signal handler do not touch it), which makes it a safe choice.
+constexpr int kThreadDumpSignal = SIGURG;
+
+// State shared between the dumping thread and the per-thread signal handler.
+// Only one thread is sampled at a time (serialized in DumpAllThreadStackTraces),
+// so a single shared buffer is sufficient.
+sem_t g_thread_dump_done_sem;
+void *g_thread_dump_frames[kMaxThreadDumpFrames];
+std::atomic<int> g_thread_dump_num_frames{0};
+
+// Async-signal-safe handler: it only captures the raw frame pointers into the
+// preallocated buffer and signals completion. Symbolization (which is not
+// async-signal-safe) is performed later by the dumping thread.
+void ThreadDumpSignalHandler(int /*signum*/) {
+  const int n =
+      absl::GetStackTrace(g_thread_dump_frames, kMaxThreadDumpFrames, /*skip_count=*/2);
+  g_thread_dump_num_frames.store(n, std::memory_order_release);
+  sem_post(&g_thread_dump_done_sem);
+}
+
+// Symbolizes a captured stack and appends it to `os`, one frame per line, using
+// the same formatting as operator<<(StackTrace).
+void AppendSymbolizedFrames(std::ostream &os, void **frames, int num_frames) {
+  char buf[16 * 1024];
+  std::unique_ptr<char *, FreeDeleter> frame_symbols(
+      backtrace_symbols(frames, num_frames));
+  for (int i = 0; i < num_frames; ++i) {
+    os << "  ";
+    if (frame_symbols != nullptr) {
+      os << frame_symbols.get()[i];
+    }
+    if (absl::Symbolize(frames[i], buf, sizeof(buf))) {
+      os << " " << buf;
+    }
+    os << "\n";
+  }
+}
+
+}  // namespace
+#endif
+
+std::string DumpAllThreadStackTraces() {
+  std::ostringstream all;
+#if defined(__linux__)
+  // Serialize concurrent dumps: the signal handler writes to shared global state.
+  static std::mutex dump_mutex;
+  std::lock_guard<std::mutex> lock(dump_mutex);
+
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    sem_init(&g_thread_dump_done_sem, /*pshared=*/0, /*value=*/0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ThreadDumpSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(kThreadDumpSignal, &sa, nullptr) != 0) {
+      RAY_LOG(WARNING) << "Failed to install thread dump signal handler: "
+                       << strerror(errno);
+    }
+  });
+
+  const pid_t pid = getpid();
+  const auto self_tid = static_cast<pid_t>(syscall(SYS_gettid));
+
+  // Warm up the stack-unwinding machinery in this thread so the signal handlers
+  // below run as little code as possible.
+  {
+    void *dummy[1];
+    absl::GetStackTrace(dummy, 1, 0);
+  }
+
+  std::vector<pid_t> tids;
+  if (DIR *dir = opendir("/proc/self/task")) {
+    while (dirent *ent = readdir(dir)) {
+      if (ent->d_name[0] == '.') {
+        continue;
+      }
+      int tid = 0;
+      if (absl::SimpleAtoi(ent->d_name, &tid)) {
+        tids.push_back(static_cast<pid_t>(tid));
+      }
+    }
+    closedir(dir);
+  }
+
+  all << "Thread dump for process (pid " << pid << "), " << tids.size()
+      << " threads:\n";
+
+  for (const pid_t tid : tids) {
+    std::string thread_name;
+    {
+      std::ifstream comm("/proc/self/task/" + std::to_string(tid) + "/comm");
+      std::getline(comm, thread_name);
+    }
+    all << "\nThread " << tid << " (" << thread_name << "):\n";
+
+    void *frames[kMaxThreadDumpFrames];
+    int num_frames = 0;
+    if (tid == self_tid) {
+      num_frames = absl::GetStackTrace(frames, kMaxThreadDumpFrames, /*skip_count=*/1);
+    } else {
+      // Drain any stale post left over from a previously timed-out thread.
+      while (sem_trywait(&g_thread_dump_done_sem) == 0) {
+      }
+      g_thread_dump_num_frames.store(0, std::memory_order_relaxed);
+      if (syscall(SYS_tgkill, pid, tid, kThreadDumpSignal) != 0) {
+        all << "  (failed to signal thread: " << strerror(errno) << ")\n";
+        continue;
+      }
+      // Wait up to 1 second for the target thread to capture its stack so that a
+      // stuck thread doesn't hang the whole dump.
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += 1;
+      if (sem_timedwait(&g_thread_dump_done_sem, &ts) != 0) {
+        all << "  (timed out waiting for thread to respond)\n";
+        continue;
+      }
+      num_frames = g_thread_dump_num_frames.load(std::memory_order_acquire);
+      if (num_frames > 0) {
+        memcpy(frames, g_thread_dump_frames, sizeof(void *) * num_frames);
+      }
+    }
+    if (num_frames <= 0) {
+      all << "  (no frames captured)\n";
+      continue;
+    }
+    AppendSymbolizedFrames(all, frames, num_frames);
+  }
+#else
+  all << "Thread dump (only the calling thread is supported on this platform):\n"
+      << ray::StackTrace();
+#endif
+  return all.str();
 }
 
 void TerminateHandler() {

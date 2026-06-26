@@ -116,6 +116,20 @@ class StackTrace {
   friend std::ostream &operator<<(std::ostream &os, const StackTrace &stack_trace);
 };
 
+/// Returns a best-effort, human-readable dump of the stack traces of *all*
+/// threads in the current process (similar to a Java/`jstack` thread dump).
+///
+/// On Linux this enumerates every thread via /proc/self/task and captures each
+/// thread's stack using a signal, then symbolizes the frames. On other
+/// platforms (or if thread enumeration fails) it falls back to dumping only the
+/// calling thread's stack.
+///
+/// This is intended to be called right before the process intentionally exits
+/// (e.g. raylet shutdown) so that operators can see what every thread was doing.
+/// It is best-effort: threads that cannot be sampled in time are noted but do
+/// not block the dump.
+std::string DumpAllThreadStackTraces();
+
 enum class RayLogLevel {
   TRACE = -2,
   DEBUG = -1,

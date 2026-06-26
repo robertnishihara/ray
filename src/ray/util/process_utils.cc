@@ -255,6 +255,9 @@ std::optional<std::vector<pid_t>> GetAllProcsWithPpid(pid_t parent_pid) {
 }
 
 void QuickExit() {
+  RAY_LOG(ERROR) << "Process is force-exiting. Dumping stack traces of all threads "
+                    "for debugging:\n"
+                 << ray::DumpAllThreadStackTraces();
   ray::RayLog::ShutDownRayLog();
   _Exit(1);
 }

@@ -59,6 +59,7 @@
 #include "ray/util/clock.h"
 #include "ray/util/cmd_line_utils.h"
 #include "ray/util/event.h"
+#include "ray/util/logging.h"
 #include "ray/util/network_util.h"
 #include "ray/util/port_persistence.h"
 #include "ray/util/process.h"
@@ -2222,6 +2223,9 @@ void NodeManager::HandleShutdownRaylet(rpc::ShutdownRayletRequest request,
       << "Shutdown RPC has received. Shutdown will happen after the RPC is replied.";
   // Exit right away if it is not graceful.
   if (!request.graceful()) {
+    RAY_LOG(ERROR) << "Raylet received a non-graceful shutdown request. Dumping "
+                      "stack traces of all threads for debugging:\n"
+                   << ray::DumpAllThreadStackTraces();
     std::_Exit(EXIT_SUCCESS);
   }
 

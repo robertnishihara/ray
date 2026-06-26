@@ -53,6 +53,7 @@
 #include "ray/util/clock.h"
 #include "ray/util/cmd_line_utils.h"
 #include "ray/util/event.h"
+#include "ray/util/logging.h"
 #include "ray/util/network_util.h"
 #include "ray/util/process.h"
 #include "ray/util/raii.h"
@@ -476,6 +477,9 @@ int main(int argc, char *argv[]) {
         }
         RAY_LOG(INFO) << "Raylet graceful shutdown triggered with death info: "
                       << node_death_info.DebugString();
+        RAY_LOG(ERROR) << "Raylet is shutting down. Dumping stack traces of all "
+                          "threads for debugging:\n"
+                       << ray::DumpAllThreadStackTraces();
 
         auto unregister_done_callback = [&main_service,
                                          &raylet_socket_name,
