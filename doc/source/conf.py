@@ -435,6 +435,7 @@ all_toc_libs += [
     "rllib",
     "serve",
     "llm",
+    "sandbox",
     "workflows",
 ]
 if build_one_lib and build_one_lib in all_toc_libs:

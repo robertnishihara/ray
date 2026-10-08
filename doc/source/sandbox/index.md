@@ -4,7 +4,7 @@ myst:
     description: "Execute untrusted model-generated code and agent tool calls safely with Ray Sandboxes using lightweight gVisor kernel isolation."
 ---
 
-(ray-core-sandboxes)=
+(ray-sandboxes)=
 
 # Ray Sandboxes
 

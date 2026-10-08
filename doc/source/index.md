@@ -19,6 +19,7 @@ Ray Train <train/train>
 Ray Tune <tune/index>
 Ray Serve <serve/index>
 Ray RLlib <rllib/index>
+Ray Sandbox <sandbox/index>
 More Libraries <ray-more-libs/index>
 APIs <apis/index>
 Ray Clusters <cluster/getting-started>

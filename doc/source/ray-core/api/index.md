@@ -9,7 +9,6 @@ runtime-env.rst
 utility.rst
 exceptions.rst
 cli.rst
-sandboxes.md
 ../../ray-observability/reference/cli.rst
 ../../ray-observability/reference/api.rst
 direct-transport.rst

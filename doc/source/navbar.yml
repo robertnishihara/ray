@@ -25,6 +25,9 @@
     - file: rllib/index
       title: Ray RLlib
       caption: Scale reinforcement learning
+    - file: sandbox/index
+      title: Ray Sandbox
+      caption: Run untrusted code in isolated sandboxes
 - file: apis/index
   title: "APIs"
 - link: https://discuss.ray.io
